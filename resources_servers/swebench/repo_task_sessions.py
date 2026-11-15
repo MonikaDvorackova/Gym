@@ -21,10 +21,10 @@ starts its own, from the spec as the server built it.
 """
 
 import dataclasses
-import logging
 import shlex
 from typing import Any, ClassVar
 
+from fastapi import FastAPI
 from pydantic import JsonValue
 
 from nemo_gym.agents import exec_idempotent
@@ -37,19 +37,17 @@ from resources_servers.swebench.sandbox_session_checkpoints import (
 )
 
 
-LOG = logging.getLogger(__name__)
-
-
 class RepoTaskSessionFields(SandboxCheckpointFields):
     """The config fields of a repository-task server, besides its own."""
 
     # Fail a seed whose anti-cheat scrub did not complete instead of handing the agent a history that may hold the
     # task's solution; the rollout is then retried. Off keeps the scrub best effort.
     anti_cheat_required: bool = False
-    # A provider-neutral egress rule for the agent's sandbox only, e.g. {"defaultAction": "deny", "egress":
-    # [{"action": "allow", "target": "10.0.0.0/8"}]} to reach the model servers and nothing else. Grading sandboxes keep
-    # the spec's network. The rule is recorded with the sandbox, so a restore's fork gets it too: name targets that stay
-    # valid across jobs (an address range, not one job's model server).
+    # An egress rule for the agent's sandbox only, in OpenSandbox's shape, e.g. {"defaultAction": "deny", "egress":
+    # [{"action": "allow", "target": "10.0.0.0/8"}]} to reach the model servers and nothing else. It needs a provider
+    # that applies ``provider_options.network_policy``; the server refuses to start on one that does not. Grading
+    # sandboxes keep the spec's network. The rule is recorded with the sandbox, so a restore's fork gets it too: name
+    # targets that stay valid across jobs (an address range, not one job's model server).
     agent_network_policy: dict[str, Any] | None = None
 
 
@@ -79,6 +77,18 @@ class RepoTaskSessionResourcesServer(CheckpointedSandboxSessionResourcesServer):
         # Only for a server whose seed records the commit; another takes it from the row.
         self._session_id_to_base_commit: dict[str, str] = {}
 
+    def setup_webserver(self) -> FastAPI:
+        # At startup, not at the first seed: a provider that ignores the rule would run every agent unrestricted.
+        if self.config.agent_network_policy is not None and not self.config.is_verifying_golden_patch:
+            provider = self.shared_provider()
+            if not getattr(provider, "applies_network_policy", False):
+                raise ValueError(
+                    f"{self.config.name}: agent_network_policy is set, but sandbox provider "
+                    f"{getattr(provider, 'name', type(provider).__name__)!r} does not apply "
+                    "provider_options.network_policy, so the agent's sandbox would keep the spec's network"
+                )
+        return super().setup_webserver()
+
     def checkpoint_mode_in_effect(self) -> CheckpointMode:
         # Golden-patch grading seeds no episode sessions, so it has nothing to checkpoint.
         if self.config.is_verifying_golden_patch:
@@ -95,21 +105,21 @@ class RepoTaskSessionResourcesServer(CheckpointedSandboxSessionResourcesServer):
     async def _pristine_untracked_files(self, sandbox: AsyncSandbox, workdir: str) -> frozenset[str]:
         """The files ``workdir`` holds untracked before the agent touches it, which its patch leaves out.
 
-        A new sandbox can refuse its first commands for a few seconds, so the listing is retried. A sandbox that still
-        cannot run it fails the seed: an empty set would make the patch capture count the image's own untracked files
-        as the agent's. A listing that runs and fails (``workdir`` is not a git repository) gives the empty set, with
-        a warning.
+        A new sandbox can refuse its first commands for a few seconds, so a listing the provider raised on is
+        retried. A listing that still cannot run, that the provider reports as not run, or that git refuses fails the
+        seed: an empty set would make the patch capture count the image's own untracked files as the agent's.
         """
         result = await exec_idempotent(
             sandbox,
             f"git -C {shlex.quote(workdir)} ls-files --others --exclude-standard",
             what=f"{self.config.name}: listing pristine untracked files",
         )
-        if result.error_type is not None:
-            raise RuntimeError(f"Task sandbox could not list its pristine untracked files: {result.error_type}")
-        if result.return_code != 0:
-            LOG.warning("%s: failed to list pristine untracked files: %s", self.config.name, result.stderr)
-            return frozenset()
+        if result.error_type is not None or result.return_code != 0:
+            reason = result.error_type or f"exit {result.return_code}"
+            raise RuntimeError(
+                f"Task sandbox could not list its pristine untracked files: {reason}: "
+                f"{(result.stderr or '').strip()[-500:]}"
+            )
         return frozenset(line.strip() for line in (result.stdout or "").splitlines() if line.strip())
 
     def _export_task_sandbox_state(self, session_id: str) -> dict[str, JsonValue]:

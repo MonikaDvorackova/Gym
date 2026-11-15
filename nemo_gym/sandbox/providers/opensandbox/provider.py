@@ -1167,6 +1167,9 @@ class OpenSandboxProvider:
     """Provider backed by the OpenSandbox SDK/server API."""
 
     name = "opensandbox"
+    # ``provider_options["network_policy"]`` is applied to the sandbox. A caller that needs the rule enforced reads
+    # this with ``getattr(provider, "applies_network_policy", False)``.
+    applies_network_policy = True
 
     def __init__(
         self,

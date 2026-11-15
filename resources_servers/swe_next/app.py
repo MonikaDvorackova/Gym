@@ -100,9 +100,12 @@ GRADING_ARTIFACTS = (
 
 async def hide_grading_artifacts(sandbox: AsyncSandbox, workdir: str) -> None:
     targets = " ".join(shlex.quote(name) for name in GRADING_ARTIFACTS)
-    result = await sandbox.exec(
+    # Among the first commands in a new sandbox, which can refuse them for a few seconds; removing twice is safe.
+    result = await exec_idempotent(
+        sandbox,
         f"cd {shlex.quote(workdir)} && rm -rf {targets} "
-        "&& if grep -qs r2e_tests run_tests.sh; then rm -f run_tests.sh; fi"
+        "&& if grep -qs r2e_tests run_tests.sh; then rm -f run_tests.sh; fi",
+        what="swe_next: hiding grading artifacts",
     )
     if result.return_code != 0:
         print(f"Failed to hide grading artifacts in {workdir}: {result.stdout}\n{result.stderr}", file=sys.stderr)
@@ -121,9 +124,12 @@ GRADING_ARTIFACTS = (
 
 async def hide_grading_artifacts(sandbox: AsyncSandbox, workdir: str) -> None:
     targets = " ".join(shlex.quote(name) for name in GRADING_ARTIFACTS)
-    result = await sandbox.exec(
+    # Among the first commands in a new sandbox, which can refuse them for a few seconds; removing twice is safe.
+    result = await exec_idempotent(
+        sandbox,
         f"cd {shlex.quote(workdir)} && rm -rf {targets} "
-        "&& if grep -qs r2e_tests run_tests.sh; then rm -f run_tests.sh; fi"
+        "&& if grep -qs r2e_tests run_tests.sh; then rm -f run_tests.sh; fi",
+        what="swe_next: hiding grading artifacts",
     )
     if result.return_code != 0:
         print(f"Failed to hide grading artifacts in {workdir}: {result.stdout}\n{result.stderr}", file=sys.stderr)
@@ -267,7 +273,10 @@ class SWENextResourcesServer(RepoTaskSessionResourcesServer):
         if verifier_session_id is not None:
             self._verifier_sandboxes[verifier_session_id] = sandbox
         await sandbox.start(spec)
-        await sandbox.exec(f"ln -sfn /workspace {shlex.quote(body.workdir)}")
+        # The first command in a new sandbox, which can refuse it for a few seconds; the link is safe to make twice.
+        await exec_idempotent(
+            sandbox, f"ln -sfn /workspace {shlex.quote(body.workdir)}", what="swe_next: linking the workdir"
+        )
         return sandbox
 
     async def _init_git_repo(self, sandbox: AsyncSandbox, workdir: str) -> None:
