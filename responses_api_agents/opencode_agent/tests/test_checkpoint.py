@@ -8,6 +8,7 @@ OpenCode-shaped SQLite database, ``run`` answers once and then waits, and ``serv
 ``resume_opencode.sh`` sends.
 """
 
+import asyncio
 import hashlib
 import json
 import os
@@ -546,6 +547,7 @@ async def test_a_relaunch_that_starts_afresh_does_not_name_the_conversation_it_s
         observations=object(),
         trajectory=object(),
         launch_records=[],
+        adoption=None,
         session=session,
         persistent_directory="/s",
         runtime="/rt",
@@ -643,6 +645,31 @@ async def test_a_re_bind_that_fails_releases_its_sandbox_connection(monkeypatch:
     # The seed that re-binds is retried: each attempt must not leave a connection behind.
     sandbox.disconnect.assert_awaited_once()
     assert state.session is None and state.restored == {"session": {}}
+
+
+@pytest.mark.parametrize(
+    "error", [asyncio.CancelledError(), ConnectionError("502 Bad Gateway")], ids=["cancel", "raise"]
+)
+async def test_a_re_bind_whose_restored_launch_check_did_not_finish_is_undone(
+    monkeypatch: pytest.MonkeyPatch, error: BaseException
+) -> None:
+    sandbox = MagicMock(sandbox_id="fork")
+    sandbox.exec = AsyncMock(return_value=SandboxExecResult(stdout="", stderr="", return_code=0))
+    sandbox.disconnect = AsyncMock()
+    agent, state, body = _restored(monkeypatch, sandbox)
+    state.keeps_processes = True
+    saved = {"session": {"pause_seq": 1, "supervisor_identity": "1.2"}}
+    state.restored = dict(saved)
+    session = SimpleNamespace(session_root="/sessions/s", session_dir="/sessions/s/launch-1", sandbox=sandbox)
+    monkeypatch.setattr(SandboxSession, "reattach", staticmethod(lambda *_, **__: session))
+    monkeypatch.setattr("responses_api_agents.opencode_agent.app.check_restored", AsyncMock(side_effect=error))
+
+    with pytest.raises(type(error)):
+        await agent._rebind_restored_agent_session_state(state, body)
+
+    # The retried seed must check the launch again: a session left re-bound would relaunch beside it.
+    assert state.session is None and state.adoption is None and state.restored == saved
+    sandbox.disconnect.assert_awaited_once()
 
 
 # -- checkpoint declarations -------------------------------------------------------------------------------------

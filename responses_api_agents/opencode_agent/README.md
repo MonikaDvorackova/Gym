@@ -493,7 +493,8 @@ relaunched when it need not be:
   `snapshots.keep_guest_clock`, and a restored sandbox continues from the clock its snapshot was taken at.
 
 The agent logs `OpenCode resumed in place:`, `OpenCode cannot resume in place:` and `OpenCode abandoned a restored
-launch:` at WARNING.
+launch:` at WARNING, except that for a checkpoint taken before the launch's relay started (`relay_gone`) the last two
+are at INFO.
 
 Sessions the agent cannot capture restart after a crash instead: a sandbox the agent owns, multi-turn continuation
 sessions, and sessions that continue an imported conversation (`session_import_path`).
