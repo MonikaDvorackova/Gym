@@ -2,23 +2,24 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # SWE-bench Verified with OpenCode running in the SWE-bench server's sandbox, through the single-agent-turn
-# Environment Server. The flat dataset rows run unchanged: single_agent_turn_legacy converts each row into a typed
-# episode. The SWE-bench server owns each task's sandbox and lends it to the OpenCode agent session.
+# Environment Server. The flat dataset rows run unchanged: single_agent_turn_legacy converts each row into an
+# episode request. The SWE-bench server owns each task's sandbox and lends it to the OpenCode agent session.
 #
 # With partial-rollout checkpointing (a top-level `checkpoint:` block, usually set by the training framework),
 # a checkpoint pauses OpenCode in place, snapshots the task sandbox, and a restore forks the snapshot and resumes
 # OpenCode without adding a turn. That needs:
 #   - a sandbox provider that can snapshot (OpenSandbox); on any other provider episodes restart after a crash;
 #   - `checkpoint.state_dir` on a filesystem every restart of the run reads, where the SWE-bench server indexes the
-#     snapshots it takes so a `release` can delete them;
-#   - no resources tool grants: OpenCode uses its own tools in the sandbox.
+#     snapshots it takes so a `release` can delete them.
 #
 #   checkpoint:
 #     enabled: true
 #     control_auth_token: ${oc.env:GYM_CHECKPOINT_TOKEN}
-#     state_dir: /lustre/<run>/gym_checkpoint_state
+#     # Absolute; one per job and its restarts; on Lustre, mount with -o flock.
+#     state_dir: /shared/<job id>/gym_checkpoint_state
 #
-# Offline sandboxes need a preinstalled OpenCode (`sandbox_executable_path`); see #4560.
+# Offline sandboxes need a preinstalled OpenCode (`sandbox_executable_path`); see "Offline sandbox runtimes" in
+# responses_api_agents/opencode_agent/README.md.
 
 config_paths:
   - resources_servers/swebench/configs/swebench.yaml
@@ -38,6 +39,11 @@ swebench_verified_opencode_sessions_resources_server:
           jsonl_fpath: benchmarks/swebench/data/swebench_verified_benchmark.jsonl
           prepare_script: benchmarks/swebench/verified/prepare.py
           num_repeats: 3
+      sandbox_config:
+        # The session lives as long as its sandbox. Outlive the episode (default_episode_timeout_seconds, 21600), the
+        # time it may spend paused for checkpoints (the agent's checkpoint_pause_allowance_seconds, 3600), patch
+        # extraction and cleanup.
+        ttl_s: 28800
 
 swebench_verified_opencode_sessions_agent:
   _inherit_from: opencode_agent
@@ -47,8 +53,9 @@ swebench_verified_opencode_sessions_agent:
       resources_server:
         type: resources_servers
         name: swebench_verified_opencode_sessions_resources_server
-      # The model's context window, as metadata; size the activation timeout to cover a checkpoint pause.
-      timeout: 10800
+      # Time a launch may spend paused for checkpoints in all; cover the longest commit. Paused time does not count
+      # against `timeout`.
+      checkpoint_pause_allowance_seconds: 3600
 
 swebench_verified_opencode_sessions:
   _inherit_from: single_agent_turn_legacy
@@ -60,4 +67,5 @@ swebench_verified_opencode_sessions:
       agent_server:
         type: responses_api_agents
         name: swebench_verified_opencode_sessions_agent
+      # SWE-bench serves no tools: OpenCode uses its own in the sandbox.
       resources_tool_transports: []
