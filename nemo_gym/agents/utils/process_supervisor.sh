@@ -39,7 +39,9 @@
 #
 # With --pause-mode hold, for a sandbox whose snapshot keeps its processes, a pause sends no signal: the
 # harness keeps running, the supervisor acknowledges at once and stops counting the deadline until the
-# continue, which sends nothing either. The checkpoint holds the harness's model calls instead.
+# continue, which sends nothing either. The checkpoint holds the harness's model calls instead. During a hold
+# the supervisor does not watch the harness either: one that exits is reaped, and its receipt written, after
+# the continue.
 #
 # usage: process_supervisor.sh --timeout SECONDS --cleanup-timeout SECONDS --receipt PATH --stop-file PATH
 #        [--expire-file PATH] [--pause-file PATH --paused PATH --continue-file PATH --continued PATH
@@ -50,7 +52,7 @@
 set +o errexit +o nounset +o pipefail
 
 usage() {
-    echo "usage: process_supervisor.sh --timeout S --cleanup-timeout S --receipt PATH --stop-file PATH [--expire-file PATH] -- COMMAND..." >&2
+    echo "usage: process_supervisor.sh --timeout S --cleanup-timeout S --receipt PATH --stop-file PATH [--expire-file PATH] [--pause-file PATH --paused PATH --continue-file PATH --continued PATH [--pause-mode stop|hold]] -- COMMAND..." >&2
     exit 2
 }
 
@@ -204,6 +206,7 @@ reached_alive() {
 stopped() { ((stopping)) || [[ -e $stop_file ]]; }
 
 expired() { [[ -n $expire_file && -e $expire_file ]]; }
+
 # How a pause treats the processes it reaches: stop sends STOP and CONT, hold sends nothing (see the header).
 pause_mode=stop
 

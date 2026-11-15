@@ -215,6 +215,7 @@ async def check_sandbox_session_checkpoints(
         assert access is not None, "the seed reply lends the session's task sandbox"
         assert seeded.headers.get("x-ng-checkpoint-restart") is None, "a provider that snapshots exports sessions"
         if first.restore_policy == "before_agent_close":
+            # Sent only on a provider whose snapshots hold files only, as this kit's provider does.
             assert seeded.headers.get("x-ng-checkpoint-restore-policy") == "before_agent_close"
         retried = await http.post(seed_path, json=seed_body)
         assert retried.status_code == 200 and retried.json()["sandbox_access"] == access, "an identical retry"

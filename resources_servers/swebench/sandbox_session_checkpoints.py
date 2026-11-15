@@ -14,10 +14,10 @@ seed, verify, close, fences and expiry it keeps as they are:
 - a release deletes the snapshots of checkpoints the controller no longer keeps.
 
 What a snapshot holds depends on the provider: always the sandbox's files, and its running processes too when the
-provider's ``snapshot_keeps_processes`` says so (a VM memory snapshot). On a provider whose snapshots hold files only,
-a server whose grader needs processes the agent started declares ``restore_policy = "before_agent_close"``: the
-environment server then starts such an episode over after a crash once its agent's turn ended, instead of
-continuing it in a fork.
+provider's ``snapshot_keeps_processes`` says so (a VM memory snapshot). A server whose grader needs processes the
+agent started declares ``restore_policy = "before_agent_close"``. The policy is sent only on a provider whose
+snapshots hold files only: the environment server then starts such an episode over after a crash once its agent's
+turn ended, instead of continuing it in a fork. A fork of a snapshot that kept the processes continues at every step.
 
 With checkpointing on, a server exports its sessions only when its sandbox provider can snapshot; otherwise it runs
 ``restart_only``, and its episodes start over after a crash.
@@ -169,7 +169,12 @@ class CheckpointedSandboxSessionResourcesServer(SandboxSessionResourcesServer):
             )
         super().setup_resources_checkpoint(app)
         if self._checkpoint is not None:
-            self._checkpoint.restore_policy = self.restore_policy
+            # A fork of a snapshot that kept the processes can continue the episode at every step.
+            keeps_processes = (
+                self._checkpoint.mode == "exported"
+                and getattr(self.shared_provider(), "snapshot_keeps_processes", False) is True
+            )
+            self._checkpoint.restore_policy = "any_step" if keeps_processes else self.restore_policy
             if self._checkpoint.mode == "exported":
                 task_model = getattr(type(self), "task_model", None)
                 if not (isinstance(task_model, type) and issubclass(task_model, BaseModel)):

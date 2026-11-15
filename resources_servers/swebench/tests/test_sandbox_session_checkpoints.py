@@ -291,6 +291,19 @@ async def test_a_server_whose_fork_cannot_outlive_its_agent_s_turn_says_so_on_it
     assert seeded.headers["x-ng-checkpoint-restore-policy"] == "before_agent_close"
 
 
+async def test_a_provider_whose_snapshots_keep_processes_sends_no_restore_policy(tmp_path: Path) -> None:
+    provider = FakeSnapshotProvider()
+    provider.snapshot_keeps_processes = True  # type: ignore[attr-defined]
+    server = make_server(provider, checkpointing_config(tmp_path), server_type=InPlaceGrader)
+    async with _http(server) as http:
+        seeded = await _post_seed(http, _seed())
+
+    # A fork of such a snapshot has the processes the grader needs, so the episode continues at every step.
+    assert seeded.status_code == 200, seeded.text
+    assert "x-ng-checkpoint-restore-policy" not in seeded.headers
+    assert seeded.headers.get("x-ng-checkpoint-restart") != "1"
+
+
 async def test_a_provider_that_cannot_snapshot_needs_no_state_dir(tmp_path: Path) -> None:
     config = {"checkpoint": {"enabled": True, "control_auth_token": "t"}}
     async with _http(make_server(FakeSandboxProvider(), config)) as http:

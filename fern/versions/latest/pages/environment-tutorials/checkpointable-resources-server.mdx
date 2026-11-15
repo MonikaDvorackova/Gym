@@ -104,10 +104,11 @@ memory snapshot). The checkpoint records which it was (`keeps_processes`).
   session past its capture exports no sandbox. Declare it only if `/verify` uses the task sandbox solely inside
   `capture_task_sandbox_patch` and stops it solely with `stop_task_sandbox_after_capture`: both hold the lock a commit
   holds while it snapshots. What the capture returns must be a JSON value, because the checkpoint stores it.
-- **In-place graders** that need processes the agent started declare `restore_policy = "before_agent_close"` on a
-  provider whose snapshots keep files only. The seed reply says so, and the environment server makes the episode a
-  restart once its agent's turn has ended, before the agent is closed, instead of continuing it in a fork that has
-  none of those processes.
+- **In-place graders** that need processes the agent started declare `restore_policy = "before_agent_close"`. The
+  policy is sent only on a provider whose snapshots keep files only: the seed reply says so, and the environment
+  server makes the episode a restart once its agent's turn has ended, before the agent is closed, instead of
+  continuing it in a fork that has none of those processes. On a provider whose snapshots keep processes, the fork has
+  them and the episode continues at every step.
 - After a restore, the environment server seeds the session again under the replacement attempt. The session answers
   with the forked sandbox and does not set the task up again.
 
