@@ -474,8 +474,8 @@ part in partial-rollout checkpoints (`checkpoint_mode = "exported"`):
   added. Otherwise OpenCode starts the task afresh from its original prompt in a fresh data directory, and the reason is
   logged.
 
-Sessions the agent cannot capture restart after a crash instead: a sandbox the agent owns, and multi-turn continuation
-sessions.
+Sessions the agent cannot capture restart after a crash instead: a sandbox the agent owns, multi-turn continuation
+sessions, and sessions that continue an imported conversation (`session_import_path`).
 
 Settings:
 
