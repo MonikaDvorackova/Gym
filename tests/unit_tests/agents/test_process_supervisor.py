@@ -21,7 +21,14 @@ SUPERVISOR = str(SUPERVISOR_SCRIPT)
 linux_only = pytest.mark.skipif(sys.platform != "linux", reason="Linux /proc is required")
 
 
-def _supervise(tmp_path: Path, *command: str, timeout: str = "10", **kwargs) -> subprocess.CompletedProcess[str]:
+def _supervise(
+    tmp_path: Path,
+    *command: str,
+    timeout: str = "10",
+    cleanup_timeout: str = "0.5",
+    run_timeout: float = 20,
+    **kwargs,
+) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [
             "bash",
@@ -29,7 +36,7 @@ def _supervise(tmp_path: Path, *command: str, timeout: str = "10", **kwargs) -> 
             "--timeout",
             timeout,
             "--cleanup-timeout",
-            "0.5",
+            cleanup_timeout,
             "--receipt",
             str(tmp_path / "cleanup.json"),
         ]
@@ -37,7 +44,7 @@ def _supervise(tmp_path: Path, *command: str, timeout: str = "10", **kwargs) -> 
         capture_output=True,
         text=True,
         errors="replace",
-        timeout=20,
+        timeout=run_timeout,
         **kwargs,
     )
 
@@ -175,7 +182,10 @@ def test_forced_stop_reaches_processes_that_leave_the_harness_during_the_stop(tm
     }[escape]
     (tmp_path / "worker.sh").write_text(worker)
     try:
-        result = _supervise(tmp_path, "bash", "worker.sh", timeout="1", cwd=tmp_path)
+        # The cleanup scans every process on the machine; on a busy one half a second is less than one scan.
+        result = _supervise(
+            tmp_path, "bash", "worker.sh", timeout="1", cleanup_timeout="15", run_timeout=60, cwd=tmp_path
+        )
         assert result.returncode == 0, result.stderr
         receipt = _receipt(tmp_path)
         assert receipt["cleanup_confirmed"] is True and receipt["timed_out"] is True, receipt
