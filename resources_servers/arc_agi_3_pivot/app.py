@@ -112,6 +112,9 @@ class ArcAgi3PivotConfig(BaseResourcesServerConfig):
     # installs under .af3/ next to this file).
     af3_src: Optional[str] = None
     harness_base: Optional[str] = None
+    # Where setup_af3.py fetches the pinned trees from on the first start (when af3_src / harness_base are unset).
+    af3_git_url: Optional[str] = None
+    harness_git_url: Optional[str] = None
     # Window: at most this many model calls (the exact-host recipe's AF3_WINDOW_MAX_CALLS). Actions per window:
     # AF3_WINDOW_ACTION_BUDGET in af3_env (AF3's default under the exact host is 12).
     max_calls: int = 24
@@ -205,7 +208,9 @@ class ArcAgi3PivotResourcesServer(SimpleResourcesServer):
         if self.config.af3_src and self.config.harness_base:
             src, base = repo_path(self.config.af3_src), repo_path(self.config.harness_base)
         else:
-            src, base = ensure_af3(DEFAULT_DEST)
+            src, base = ensure_af3(
+                DEFAULT_DEST, af3_url=self.config.af3_git_url, harness_url=self.config.harness_git_url
+            )
         self._harness_base = str(base)
         self._games = str(repo_path(self.config.pool_dir) / "games.parquet")
         if not Path(self._games).is_file():

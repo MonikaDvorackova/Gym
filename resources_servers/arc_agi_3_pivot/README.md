@@ -64,7 +64,7 @@ context budget (`model_context_limit`, discarded as in AF3), and a window cut sh
 ## Setup
 
 **External code** (NVIDIA-internal, not vendored; fetched at pinned commits by `setup_af3.py` on the first start, into
-`.af3/` here):
+`.af3/` here, from the repositories set in `af3_git_url` and `harness_git_url`):
 
 | Tree | Pin | Used |
 |---|---|---|

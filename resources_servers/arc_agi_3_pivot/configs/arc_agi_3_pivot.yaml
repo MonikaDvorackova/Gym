@@ -14,6 +14,10 @@ arc_agi_3_pivot_resources_server:
       # null = the pinned trees setup_af3.py installs under resources_servers/arc_agi_3_pivot/.af3/
       af3_src: null
       harness_base: null
+      # Repositories to fetch the pinned agent-factory-3 / duck-harness commits from (first start, when the two above
+      # are null).
+      af3_git_url: null
+      harness_git_url: null
       max_calls: 24
       af3_env:
         AF3_EXACT_HOST: "1"
