@@ -33,7 +33,6 @@ agent's, the dataset-health check: a row whose golden source does not resolve is
 
 import shlex
 import sys
-from pathlib import Path
 from time import time
 from traceback import format_exc
 from typing import Any
@@ -79,9 +78,6 @@ class DeNovoSWEResourcesServerConfig(BaseResourcesServerConfig):
     # A verdict-less run is retried on a fresh sandbox: an image pull or a flaky provider start
     # is not evidence about the patch.
     inconclusive_verification_retries: int = 1
-    # Verification logs are off unless this or the global debug_dir names a folder.
-    # Give an absolute node-local path, such as one under /tmp.
-    debug_dir: Path | None = None
     apply_anti_cheating: bool = True
     sandbox_provider: str
     sandbox_config: dict[str, Any]
@@ -302,7 +298,10 @@ class DeNovoSWEResourcesServer(SimpleResourcesServer):
 
         inputs = self._inputs(body, patch)
         log_dir = debug_folder(
-            server_name=self.config.name, kind="verification", label=body.instance_id, override=self.config.debug_dir
+            server_name=self.config.name,
+            kind="verification",
+            label=body.instance_id,
+            debug_files=self.config.debug_files,
         )
 
         files = verification_files(inputs, is_golden)

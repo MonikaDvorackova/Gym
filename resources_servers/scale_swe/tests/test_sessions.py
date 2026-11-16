@@ -20,7 +20,8 @@ import resources_servers.scale_swe.app as scale_swe_app
 import resources_servers.scale_swe.verification as verification
 import resources_servers.swebench.patch_capture as patch_capture
 from nemo_gym.client import SESSION_ID_KEY, ServerClient
-from nemo_gym.core import EpisodeId, TaskId
+from nemo_gym.config.global_config import RESULTS_DIR_KEY_NAME
+from nemo_gym.core import EpisodeId, TaskId, runtime_files
 from nemo_gym.sandbox.providers.base import SandboxExecResult
 from nemo_gym.server_runtime import (
     ResourcesCloseSessionRequest,
@@ -947,15 +948,20 @@ async def test_golden_patch_mode_refuses_episode_seeds(server):
 
 
 @pytest.mark.parametrize("configured", [False, True])
-async def test_verification_logs_are_written_only_under_the_configured_folder(server, grading, tmp_path, configured):
-    if configured:
-        server.config.debug_dir = tmp_path
+async def test_verification_logs_are_written_only_under_the_configured_folder(
+    monkeypatch, server, grading, tmp_path, configured
+):
+    # The results folder is set either way, so only the debug_files switch differs.
+    monkeypatch.setattr(runtime_files, "maybe_get_global_config_dict", lambda: {RESULTS_DIR_KEY_NAME: str(tmp_path)})
+    server.config.name = "scale_swe"
+    server.config.debug_files = configured
     request = SimpleNamespace(session={})
     await server.seed_session(request, seed())
     await server.verify(request, verify_body())
     log_dir = grading.run.await_args.kwargs["log_dir"]
     if configured:
-        assert log_dir.is_relative_to(tmp_path) and log_dir.name == "attempt-1"
+        assert log_dir.is_relative_to(tmp_path / "scale_swe" / "debug" / "verification")
+        assert log_dir.name == "attempt-1"
     else:
-        # Without a folder, nothing is written; the server's own source folder is never the default.
+        # With debug files off nothing is written; the server's own source folder is never used.
         assert log_dir is None

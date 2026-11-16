@@ -114,17 +114,13 @@ class SwebenchResourcesServerConfig(BaseResourcesServerConfig):
     sandbox_provider: str
     sandbox_config: Dict[str, Any]
 
-    # The harness writes each verification's logs to a temporary folder that is removed afterwards.
-    # They are kept only when this or the global debug_dir names a folder.
-    # Give an absolute node-local path, such as one under /tmp.
-    debug_dir: Path | None = None
     # No longer has an effect: the harness logs are always removed after each verify.
     # It is still accepted so existing configs load.
     clear_swebench_debug_logs: bool | None = None
 
     def model_post_init(self, context: Any, /) -> None:
-        if self.clear_swebench_debug_logs is False and self.debug_dir is None:
-            LOG.warning("clear_swebench_debug_logs no longer keeps logs. Set debug_dir to keep each verify's logs.")
+        if self.clear_swebench_debug_logs is False and not self.debug_files:
+            LOG.warning("clear_swebench_debug_logs no longer keeps logs. Set debug_files to keep each verify's logs.")
 
 
 class SWEBenchInstanceRequest(BaseModel):
@@ -549,7 +545,10 @@ Stderr:
         # Res has 2 keys: completed (whether evaluation completed or not), resolved (whether the issue is resolved)
         start_time = time()
         log_dir = debug_folder(
-            server_name=self.config.name, kind="verification", label=body.instance_id, override=self.config.debug_dir
+            server_name=self.config.name,
+            kind="verification",
+            label=body.instance_id,
+            debug_files=self.config.debug_files,
         )
         # The harness writes its logs under its working directory by default, which is this server's source folder.
         # A temporary folder keeps them off the checkout.

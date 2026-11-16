@@ -31,7 +31,6 @@ the dataset-health check: a row whose golden patch does not resolve is a broken 
 
 import shlex
 import sys
-from pathlib import Path
 from time import time
 from traceback import format_exc
 from typing import Any
@@ -93,9 +92,6 @@ class SwemerUltraResourcesServerConfig(BaseResourcesServerConfig):
     patch_capture_mode: PatchCaptureMode = "worktree"
     include_model_patch_in_response: bool = True
     evaluation_timeout: int | None = 1200
-    # Verification logs are off unless this or the global debug_dir names a folder.
-    # Give an absolute node-local path, such as one under /tmp.
-    debug_dir: Path | None = None
     # A verdict-less run is retried on a fresh sandbox: an image pull or a flaky provider start
     # is not evidence about the patch.
     inconclusive_verification_retries: int = 1
@@ -393,7 +389,10 @@ class SwemerUltraResourcesServer(SandboxSessionResourcesServer):
 
         inputs = self._inputs(body, patch)
         log_dir = debug_folder(
-            server_name=self.config.name, kind="verification", label=body.instance_id, override=self.config.debug_dir
+            server_name=self.config.name,
+            kind="verification",
+            label=body.instance_id,
+            debug_files=self.config.debug_files,
         )
 
         files = verification_files(inputs, overwrite_maven_settings=self.config.overwrite_maven_settings)

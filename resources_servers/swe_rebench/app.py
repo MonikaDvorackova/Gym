@@ -98,9 +98,6 @@ class SWERebenchResourcesServerConfig(BaseResourcesServerConfig):
     patch_capture_mode: PatchCaptureMode = "worktree"
     include_model_patch_in_response: bool = True
     evaluation_timeout: int | None = 3600
-    # Verification logs are off unless this or the global debug_dir names a folder.
-    # Give an absolute node-local path, such as one under /tmp.
-    debug_dir: Path | None = None
     # A verdict-less run is retried on a fresh sandbox: an image pull or a flaky provider start
     # is not evidence about the patch.
     inconclusive_verification_retries: int = 1
@@ -375,7 +372,10 @@ class SWERebenchResourcesServer(SandboxSessionResourcesServer):
 
         inputs = self._inputs(body, patch)
         log_dir = debug_folder(
-            server_name=self.config.name, kind="verification", label=body.instance_id, override=self.config.debug_dir
+            server_name=self.config.name,
+            kind="verification",
+            label=body.instance_id,
+            debug_files=self.config.debug_files,
         )
 
         # Resolve the parser before spending a sandbox on the run: an unknown parser name means

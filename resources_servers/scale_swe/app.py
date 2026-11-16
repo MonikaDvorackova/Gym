@@ -40,7 +40,6 @@ import sys
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field, replace
-from pathlib import Path
 from time import time
 from traceback import format_exc
 from typing import Any
@@ -112,9 +111,6 @@ class ScaleSWEResourcesServerConfig(BaseResourcesServerConfig):
     # A verdict-less run is retried on a fresh sandbox: an image pull or a flaky provider start
     # is not evidence about the patch.
     inconclusive_verification_retries: int = 1
-    # Verification logs are off unless this or the global debug_dir names a folder.
-    # Give an absolute node-local path, such as one under /tmp.
-    debug_dir: Path | None = None
     apply_anti_cheating: bool = True
     sandbox_stop_timeout_seconds: float = Field(
         default=120,
@@ -773,7 +769,10 @@ class ScaleSWEResourcesServer(SimpleResourcesServer):
 
         inputs = self._inputs(body, patch)
         log_dir = debug_folder(
-            server_name=self.config.name, kind="verification", label=body.instance_id, override=self.config.debug_dir
+            server_name=self.config.name,
+            kind="verification",
+            label=body.instance_id,
+            debug_files=self.config.debug_files,
         )
 
         files = verification_files(inputs)

@@ -22,7 +22,8 @@ from fastapi.testclient import TestClient
 from pytest import MonkeyPatch
 
 from nemo_gym.client import ServerClient
-from nemo_gym.core import EpisodeId, TaskId
+from nemo_gym.config.global_config import RESULTS_DIR_KEY_NAME
+from nemo_gym.core import EpisodeId, TaskId, runtime_files
 from nemo_gym.sandbox import SandboxExecResult, SandboxHandle
 from nemo_gym.server_runtime import ResourcesSeedSessionRequest, check_resources_session_contract
 from resources_servers.swe_gym import app as swe_gym_app
@@ -153,14 +154,16 @@ def test_verification_logs_are_written_only_under_the_configured_folder(
     monkeypatch: MonkeyPatch, tmp_path: Path, configured: bool
 ) -> None:
     server, _ = _server(monkeypatch)
-    if configured:
-        server.config.debug_dir = tmp_path
+    # The results folder is set either way, so only the debug_files switch differs.
+    monkeypatch.setattr(runtime_files, "maybe_get_global_config_dict", lambda: {RESULTS_DIR_KEY_NAME: str(tmp_path)})
+    server.config.debug_files = configured
     with TestClient(server.setup_webserver(), raise_server_exceptions=False) as client:
         assert client.post("/seed_session", json=_seed().model_dump(mode="json")).status_code == 200
         assert client.post("/verify", json=_VERIFY).status_code == 200
     log_dir = swe_gym_app.run_verification.await_args.kwargs["log_dir"]
     if configured:
-        assert log_dir.is_relative_to(tmp_path) and log_dir.name == "attempt-1"
+        assert log_dir.is_relative_to(tmp_path / "swe_gym" / "debug" / "verification")
+        assert log_dir.name == "attempt-1"
     else:
-        # Without a folder, nothing is written; the server's own source folder is never the default.
+        # With debug files off nothing is written; the server's own source folder is never used.
         assert log_dir is None

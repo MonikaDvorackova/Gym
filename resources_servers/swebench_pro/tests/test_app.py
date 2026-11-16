@@ -31,7 +31,8 @@ from itsdangerous import TimestampSigner
 from pytest import MonkeyPatch
 
 from nemo_gym.client import SESSION_ID_KEY, ServerClient
-from nemo_gym.core import SESSION_LOST, EpisodeId, NeMoGymResponse, TaskId
+from nemo_gym.config.global_config import RESULTS_DIR_KEY_NAME
+from nemo_gym.core import SESSION_LOST, EpisodeId, NeMoGymResponse, TaskId, runtime_files
 from nemo_gym.sandbox import SandboxExecResult
 from nemo_gym.server_runtime import (
     ResourcesCloseSessionRequest,
@@ -183,7 +184,9 @@ def test_golden_patch_verify_and_cleanup(monkeypatch: MonkeyPatch) -> None:
 def test_verification_logs_are_written_only_under_the_configured_folder(
     monkeypatch: MonkeyPatch, tmp_path: Path, configured: bool
 ) -> None:
-    server = make_server(golden=True, debug_dir=tmp_path if configured else None)
+    # The results folder is set either way, so only the debug_files switch differs.
+    monkeypatch.setattr(runtime_files, "maybe_get_global_config_dict", lambda: {RESULTS_DIR_KEY_NAME: str(tmp_path)})
+    server = make_server(golden=True, debug_files=configured)
     monkeypatch.setattr(server, "_create_sandbox", AsyncMock(return_value=SimpleNamespace(stop=AsyncMock())))
     verify = AsyncMock(
         return_value=VerificationResult(completed=True, resolved=True, patch_applied=True, test_results={"tests": []})
@@ -195,10 +198,11 @@ def test_verification_logs_are_written_only_under_the_configured_folder(
     assert response.status_code == 200
     log_dir = verify.await_args.kwargs["log_dir"]
     if configured:
-        assert log_dir.is_relative_to(tmp_path) and log_dir.name == "attempt-1"
+        assert log_dir.is_relative_to(tmp_path / server.config.name / "debug" / "verification")
+        assert log_dir.name == "attempt-1"
         assert response.json()["log_dir"] == str(log_dir.parent)
     else:
-        # Without a folder, nothing is written; the server's own source folder is never the default.
+        # With debug files off nothing is written; the server's own source folder is never used.
         assert log_dir is None
         assert response.json()["log_dir"] == ""
 

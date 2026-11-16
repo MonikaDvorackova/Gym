@@ -32,7 +32,6 @@ the dataset-health check; ``apply_golden_patch.py`` runs it over the training js
 """
 
 import sys
-from pathlib import Path
 from shlex import quote
 from time import time
 from traceback import format_exc
@@ -95,9 +94,6 @@ class R2EGymResourcesServerConfig(BaseResourcesServerConfig):
     # A verdict-less run is retried on a fresh sandbox: an image pull or a flaky provider start
     # is not evidence about the patch.
     inconclusive_verification_retries: int = 1
-    # Verification logs are off unless this or the global debug_dir names a folder.
-    # Give an absolute node-local path, such as one under /tmp.
-    debug_dir: Path | None = None
     apply_anti_cheating: bool = True
     sandbox_provider: str
     sandbox_config: dict[str, Any]
@@ -370,7 +366,10 @@ class R2EGymResourcesServer(SandboxSessionResourcesServer):
             )
 
         log_dir = debug_folder(
-            server_name=self.config.name, kind="verification", label=body.instance_id, override=self.config.debug_dir
+            server_name=self.config.name,
+            kind="verification",
+            label=body.instance_id,
+            debug_files=self.config.debug_files,
         )
         files = verification_files(inputs)
         attempts = 1 + max(self.config.inconclusive_verification_retries, 0)

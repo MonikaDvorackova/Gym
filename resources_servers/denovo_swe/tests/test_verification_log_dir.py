@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Verification logs stay out of the server's source folder unless debug_dir names a folder."""
+"""Verification logs are written only when debug files are on, and then under the server's results folder."""
 
 from pathlib import Path
 from types import SimpleNamespace
@@ -21,6 +21,8 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from nemo_gym.client import SESSION_ID_KEY, ServerClient
+from nemo_gym.config.global_config import DEBUG_FILES_KEY_NAME, RESULTS_DIR_KEY_NAME
+from nemo_gym.core import runtime_files
 from resources_servers.denovo_swe import app as denovo_swe_app
 from resources_servers.denovo_swe.app import (
     DeNovoSWEResourcesServer,
@@ -33,8 +35,12 @@ from resources_servers.denovo_swe.verification import VerificationResult
 _INSTANCE_ID = "owner/repo-1"
 
 
-async def _verify_log_dir(monkeypatch: pytest.MonkeyPatch, log_root: Path | None) -> Path | None:
-    """Run one golden-patch verify and return the log folder the verifier was handed."""
+async def _verify_log_dir(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, *, debug_files: bool | None, global_debug_files: bool = False
+) -> Path | None:
+    """Run one golden-patch verify with results under ``tmp_path`` and return the log folder the verifier got."""
+    global_config = {RESULTS_DIR_KEY_NAME: str(tmp_path), DEBUG_FILES_KEY_NAME: global_debug_files}
+    monkeypatch.setattr(runtime_files, "maybe_get_global_config_dict", lambda: global_config)
     config = DeNovoSWEResourcesServerConfig(
         host="0.0.0.0",
         port=8080,
@@ -43,7 +49,7 @@ async def _verify_log_dir(monkeypatch: pytest.MonkeyPatch, log_root: Path | None
         sandbox_provider="docker",
         sandbox_config={},
         is_verifying_golden_patch=True,
-        debug_dir=log_root,
+        debug_files=debug_files,
     )
     server = DeNovoSWEResourcesServer(config=config, server_client=MagicMock(spec=ServerClient))
     monkeypatch.setattr(server, "_create_sandbox", AsyncMock(return_value=MagicMock()))
@@ -74,15 +80,28 @@ async def _verify_log_dir(monkeypatch: pytest.MonkeyPatch, log_root: Path | None
 
 
 @pytest.mark.asyncio
-async def test_no_log_folder_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
-    assert await _verify_log_dir(monkeypatch, None) is None
+async def test_no_log_folder_by_default(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    assert await _verify_log_dir(monkeypatch, tmp_path, debug_files=None) is None
+    assert not any(tmp_path.iterdir())
 
 
 @pytest.mark.asyncio
-async def test_logs_go_under_the_configured_folder(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    log_dir = await _verify_log_dir(monkeypatch, tmp_path)
+async def test_the_server_switch_puts_logs_under_its_results(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    log_dir = await _verify_log_dir(monkeypatch, tmp_path, debug_files=True)
 
-    # <debug_dir>/verification/<rollout>/<agent instance>/<time>-<instance id>-<random>/attempt-1
-    assert log_dir.relative_to(tmp_path).parts[0] == "verification"
+    # <results_dir>/<server>/debug/verification/<rollout>/<time>-<instance id>-<random>/attempt-1
+    assert log_dir.relative_to(tmp_path).parts[:3] == ("denovo_swe", "debug", "verification")
     assert "-owner%2Frepo-1-" in log_dir.parent.name
     assert log_dir.name == "attempt-1"
+
+
+@pytest.mark.asyncio
+async def test_the_global_switch_turns_logs_on(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    log_dir = await _verify_log_dir(monkeypatch, tmp_path, debug_files=None, global_debug_files=True)
+
+    assert log_dir.is_relative_to(tmp_path / "denovo_swe" / "debug" / "verification")
+
+
+@pytest.mark.asyncio
+async def test_the_server_switch_overrides_the_global_one(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    assert await _verify_log_dir(monkeypatch, tmp_path, debug_files=False, global_debug_files=True) is None
