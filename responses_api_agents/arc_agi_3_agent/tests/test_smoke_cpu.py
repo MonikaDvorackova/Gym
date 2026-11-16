@@ -30,7 +30,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from nemo_gym.server_utils import ServerClient
+from nemo_gym.client.server_client import ServerClient
 from resources_servers.arc_agi_3.app import ArcAgi3ResourcesServer, ArcAgi3ResourcesServerConfig, ArcAgi3VerifyRequest
 from responses_api_agents.arc_agi_3_agent.gym_transport import GymChatTransport, RequestsProxy
 from responses_api_agents.arc_agi_3_agent.harness_runtime import (
@@ -81,7 +81,7 @@ class EmulatedGymModel:
         self.rejected = None
         self._next_session = 0
 
-    async def post(self, body, cookies):
+    async def post(self, body, cookies, game_key=None):
         # Like Gym's session middleware: a request without a session cookie opens a new session. The transport
         # keeps one cookie per game, so the cookie identifies the game across history trims.
         session = (cookies or {}).get("session")

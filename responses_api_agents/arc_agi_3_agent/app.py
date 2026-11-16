@@ -16,8 +16,10 @@
 
 The harness is the pinned, unmodified ``duck-harness`` build of Kaggle submission 57908411 (see
 ``harness_manifest.json`` and ``setup_harness.py``). Its model calls go to the Gym model server
-(``gym_transport.py``). Each ``/run`` plays the row's game for up to ``play_seconds`` and sends the taaf game record to
-the ``arc_agi_3`` resources server, which scores it (RHAE).
+(``gym_transport.py``), on the run's rollout path (``url_path_for_run``), so token capture applies to every call. Each
+``/run`` plays the row's game for up to ``play_seconds`` and sends the taaf game record to the ``arc_agi_3`` resources
+server, which scores it (RHAE). The result carries ``ng_agent_observations`` (``call_log.py``): the game's accepted
+gameplay calls in order and one compaction record per history drain.
 
 All harness settings are process-wide (the harness reads them once from the environment), so one agent server is one
 hyperparameter configuration. Run the rows of one evaluation concurrently (concurrency >= rows) so that every game
@@ -32,7 +34,7 @@ import re
 from contextlib import asynccontextmanager
 from pathlib import Path
 from time import time
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Literal, Optional, Tuple
 from uuid import uuid4
 
 from fastapi import Body, FastAPI, Request, Response
@@ -40,18 +42,24 @@ from omegaconf import OmegaConf
 from pydantic import ConfigDict, Field
 
 from nemo_gym import PARENT_DIR
-from nemo_gym.base_resources_server import BaseRunRequest, BaseVerifyResponse
-from nemo_gym.base_responses_api_agent import BaseResponsesAPIAgentConfig, SimpleResponsesAPIAgent
-from nemo_gym.config_types import AggregateMetrics, AggregateMetricsRequest, ModelServerRef, ResourcesServerRef
-from nemo_gym.global_config import get_first_server_config_dict
-from nemo_gym.openai_utils import (
+from nemo_gym.agents.base_responses_api_agent import BaseResponsesAPIAgentConfig, SimpleResponsesAPIAgent
+from nemo_gym.client.http_client import get_response_json, raise_for_status, request
+from nemo_gym.config.config_types import (
+    AggregateMetrics,
+    AggregateMetricsRequest,
+    ModelServerRef,
+    ResourcesServerRef,
+)
+from nemo_gym.config.global_config import get_first_server_config_dict
+from nemo_gym.core.responses_api_types import (
     NeMoGymResponse,
     NeMoGymResponseCreateParamsNonStreaming,
     NeMoGymResponseOutputMessage,
     NeMoGymResponseOutputText,
 )
-from nemo_gym.server_utils import get_response_json, raise_for_status, request
+from nemo_gym.server_runtime.base_resources_server import BaseRunRequest, BaseVerifyResponse
 from resources_servers.arc_agi_3.setup_arc_agi import ensure_flask
+from responses_api_agents.arc_agi_3_agent.call_log import GameCallLog, observations
 from responses_api_agents.arc_agi_3_agent.gym_transport import GymChatTransport, RequestsProxy
 from responses_api_agents.arc_agi_3_agent.harness_runtime import (
     GameStartError,
@@ -117,6 +125,12 @@ class ArcAgi3AgentConfig(BaseResponsesAPIAgentConfig):
 
     # Play budget per game (seconds from the game's start; the kit's public25 mode plays 7200 s).
     play_seconds: float = 7200.0
+    # shared: one run clock, as the kit (every game's play ends at the first game's start + play_seconds; RHAE@T from
+    # that origin). per_game: each game has play_seconds from its own start (RL rollouts, sent whenever the trainer
+    # sends them; RHAE@T from the game's start).
+    run_clock: Literal["shared", "per_game"] = "shared"
+    # Action budget per game (None: no limit, as the kit).
+    max_actions_per_game: Optional[int] = None
     # Games played at once (harness worker threads) and attempts sharing the sandbox memory pool.
     concurrency: int = 25
     num_attempts: int = 25
@@ -187,6 +201,8 @@ class ArcAgi3Agent(SimpleResponsesAPIAgent):
         # The runtime's start, owned by the agent (not by the request that triggered it), and the shutdown flag.
         self._runtime_start: Optional[asyncio.Future] = None
         self._closing = False
+        # Each game's model-call URL path (its run's rollout path), by transport game key.
+        self._game_url_paths: Dict[str, str] = {}
         return super().model_post_init(context)
 
     def setup_webserver(self) -> FastAPI:
@@ -229,10 +245,12 @@ class ArcAgi3Agent(SimpleResponsesAPIAgent):
         name = self.config.run_name or dt.datetime.now().strftime("%Y%m%d_%H%M%S")
         return repo_path(self.config.output_dir) / name
 
-    async def _post_model(self, body: Dict[str, Any], cookies: Optional[Dict[str, str]]) -> Tuple[int, str, Dict]:
+    async def _post_model(
+        self, body: Dict[str, Any], cookies: Optional[Dict[str, str]], game_key: Optional[str] = None
+    ) -> Tuple[int, str, Dict]:
         response = await self.server_client.post(
             server_name=self.config.model_server.name,
-            url_path="/v1/chat/completions",
+            url_path=self._game_url_paths.get(game_key or "", "/v1/chat/completions"),
             json=body,
             cookies=cookies,
         )
@@ -344,6 +362,8 @@ class ArcAgi3Agent(SimpleResponsesAPIAgent):
             save_every_s=self.config.save_every_s,
             game_server_url=game_server_url,
             api_key=f"arc3-{uuid4().hex}",
+            shared_clock=self.config.run_clock == "shared",
+            max_actions_per_game=self.config.max_actions_per_game,
         )
         run_config = await self.run_config(env, model_config) | {"game_server": game_server_url}
         try:
@@ -397,15 +417,27 @@ class ArcAgi3Agent(SimpleResponsesAPIAgent):
         runtime = await self._ensure_runtime()
         meta = body.verifier_metadata
         record, agent_error, persistence_error, solver_note = None, None, None, None
-        scorecard_id, guid = None, None
+        scorecard_id, guid, started_at = None, None, None
+        index = int(meta.get("dispatch_index", 0))
+        game_key = f"{index}:{meta.get('full_game_id') or meta.get('game_id')}:{uuid4().hex[:12]}"
+        self._game_url_paths[game_key] = self.url_path_for_run("/v1/chat/completions", body)
         try:
-            attempt = await runtime.play_game(meta, int(meta.get("dispatch_index", 0)), self._transport)
+            attempt = await runtime.play_game(meta, index, self._transport, game_key=game_key)
             record, agent_error = attempt.record, attempt.play_error
             persistence_error, solver_note = attempt.persistence_error, attempt.solver_note
-            scorecard_id, guid = attempt.scorecard_id, attempt.guid
+            scorecard_id, guid, started_at = attempt.scorecard_id, attempt.guid, attempt.started_at_utc
         except GameStartError as exc:  # never started: no record, scored as not started
             LOG.error("ARC-AGI-3 game %s could not start: %s", meta.get("game_id"), exc)
             agent_error = f"GameStartError: {exc}"
+        finally:
+            self._game_url_paths.pop(game_key, None)
+        bundle = observations(
+            self._transport.take_call_log(game_key) if self._transport is not None else GameCallLog(),
+            invocation_id=game_key,
+            model_ref=ModelServerRef(type="responses_api_models", name=self.config.model_server.name),
+            status="failed" if agent_error else ("completed" if record is not None else "unknown"),
+            stop_reason=(record or {}).get("state"),
+        )
         verify_body = body.model_dump() | {
             "response": self._attempt_response(body, record).model_dump(),
             "game_record": record,
@@ -415,7 +447,7 @@ class ArcAgi3Agent(SimpleResponsesAPIAgent):
             "agent_error": agent_error,
             "persistence_error": persistence_error,
             "solver_note": solver_note,
-            "benchmark_start_time": runtime.start_time_utc,
+            "benchmark_start_time": runtime.start_time_utc if self.config.run_clock == "shared" else started_at,
         }
         verify_response = await self.server_client.post(
             server_name=self.config.resources_server.name,
@@ -428,6 +460,7 @@ class ArcAgi3Agent(SimpleResponsesAPIAgent):
         result["run_dir"] = str(runtime.run_dir)
         result["run_config_sha256"] = runtime.run_config_sha256
         result["harness"] = HARNESS_NAME
+        result["ng_agent_observations"] = bundle.model_dump(mode="json")
         return ArcAgi3AgentVerifyResponse.model_validate(result)
 
     async def aggregate_metrics(self, body: AggregateMetricsRequest = Body()) -> AggregateMetrics:

@@ -21,8 +21,8 @@ from pathlib import Path
 import pytest
 import requests
 
-from nemo_gym.openai_utils import NeMoGymChatCompletionCreateParamsNonStreaming
-from nemo_gym.responses_converter import VLLMConverter
+from nemo_gym.core.responses_api_types import NeMoGymChatCompletionCreateParamsNonStreaming
+from nemo_gym.models.chat_completions_converter import VLLMConverter
 from responses_api_agents.arc_agi_3_agent.gym_transport import (
     GymChatTransport,
     GymHTTPResponse,
@@ -176,7 +176,7 @@ class TestTransport:
         loop = self.run_loop()
         seen = []
 
-        async def post(body, cookies):
+        async def post(body, cookies, game_key=None):
             seen.append((body, cookies))
             reply = {"choices": [{"message": {"role": "assistant", "content": "<think>R</think>"}}]}
             return 200, json.dumps(reply), {"session": f"s{len(seen)}"}
@@ -198,10 +198,10 @@ class TestTransport:
     def test_timeout_and_connection_errors(self) -> None:
         loop = self.run_loop()
 
-        async def slow(body, cookies):
+        async def slow(body, cookies, game_key=None):
             await asyncio.sleep(5)
 
-        async def broken(body, cookies):
+        async def broken(body, cookies, game_key=None):
             raise OSError("refused")
 
         with pytest.raises(requests.exceptions.ReadTimeout):
@@ -243,7 +243,7 @@ class TestContinuations:
         thread = threading.Thread(target=loop.run_forever, daemon=True)
         thread.start()
 
-        async def post(body, cookies):
+        async def post(body, cookies, game_key=None):
             reply = {"choices": [{"message": {"role": "assistant", "content": "<think>record</think>"}}]}
             return 200, json.dumps(reply), {}
 
@@ -266,7 +266,7 @@ class TestCancellation:
     def test_cancelled_before_send(self) -> None:
         sent = []
 
-        async def post(body, cookies):
+        async def post(body, cookies, game_key=None):
             sent.append(body)
             return 200, "{}", {}
 
@@ -285,7 +285,7 @@ class TestCancellation:
 
         monkeypatch.setattr(gym_transport, "CANCEL_POLL_S", 0.05)
 
-        async def slow(body, cookies):
+        async def slow(body, cookies, game_key=None):
             await asyncio.sleep(30)
 
         transport = GymChatTransport(self.run_loop(), slow)
@@ -317,7 +317,7 @@ class TestCancellation:
     @pytest.mark.parametrize("timeout", [30, None, (5, 30)])
     def test_upstream_timeout_is_raised_at_once(self, timeout) -> None:
         # F9: a call that finished by raising a timeout is not a wait that ran out: no polling until the deadline.
-        async def times_out(body, cookies):
+        async def times_out(body, cookies, game_key=None):
             raise asyncio.TimeoutError("body read timed out")
 
         out = self.call_in_thread(GymChatTransport(self.run_loop(), times_out), timeout)
@@ -325,7 +325,7 @@ class TestCancellation:
         assert "timed out" in str(out["error"]) and out["seconds"] < 1
 
     def test_upstream_os_error_is_a_connection_error(self) -> None:
-        async def refused(body, cookies):
+        async def refused(body, cookies, game_key=None):
             raise ConnectionRefusedError("refused")
 
         out = self.call_in_thread(GymChatTransport(self.run_loop(), refused), None)
@@ -336,7 +336,7 @@ class TestCancellation:
 
         monkeypatch.setattr(gym_transport, "CANCEL_POLL_S", 0.05)
 
-        async def slow(body, cookies):
+        async def slow(body, cookies, game_key=None):
             await asyncio.sleep(30)
 
         out = self.call_in_thread(GymChatTransport(self.run_loop(), slow), 0.3)

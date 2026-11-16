@@ -55,6 +55,8 @@ The harness reads its settings once per process, so one agent server is one conf
 | `context_window_tokens` | `LOCAL_ANALYZER_CONTEXT_WINDOW` | 131072 |
 | `context_keep_tokens` | `ARC3_CONTEXT_KEEP_TOKENS` (history size after a trim) | 24576 |
 | `play_seconds` | per-game runtime limit | 7200 |
+| `run_clock` | `shared`: one run clock (the kit), every game ends at the first game's start + `play_seconds`, RHAE@T from that origin. `per_game`: each game has `play_seconds` from its own start, RHAE@T from it (training) | `shared` |
+| `max_actions_per_game` | the solver's action budget per game | unset (no limit) |
 | `harness_env` | any other harness variable, applied last | `{}` |
 | `chat_template_kwargs` | sent with every request; the harness's own values win. Model-specific defaults are in the model server config | `{}` |
 | `extra_body` | extra vLLM request fields | `{}` |
@@ -64,6 +66,32 @@ Notes:
 - **`max_output_tokens` also caps the reasoning.** When a reply hits the cap inside its reasoning, the harness (`ARC3_FORCE_ACT`) closes the reasoning and continues the reply to a tool call.
 - **Past reasoning stays in the prompt.** The harness sends `preserve_thinking: true` (the kit's Qwen template). Nemotron 3.5's template drops past reasoning by default; `nemotron_3_5_super_vl.yaml` sets `truncate_history_thinking: false` to keep it.
 - **Medium reasoning effort** on Nemotron: `chat_template_kwargs: {medium_effort: true}` (the model config keeps `truncate_history_thinking: false`).
+
+## Training (end-to-end RL)
+
+The same agent serves training rollouts: one rollout plays one game from level 0 with the deployed harness, history
+drains included. Set `run_clock: per_game` (rollouts start whenever the trainer sends them) and a budget
+(`play_seconds`, `max_actions_per_game`); repeats of one game (a GRPO group) play side by side, each with its own
+files (`<game>_p<n>`).
+
+- **Model calls.** Every harness call goes to the model server on the run's rollout path (`url_path_for_run`), so
+  Gym token capture applies to all of them. Enable it with `token_id_capture: true` on the agent and the run-wide
+  `token_id_capture` settings ([external agent harnesses](../../fern/versions/latest/pages/training-tutorials/external-agent-harnesses.mdx)).
+- **Several context chains per rollout.** A history drain drops old turns (and, with `ARC3_TURN_COMPACTION_MODE=drainsum`,
+  inserts a summary the model wrote in a helper call), so the next gameplay request starts a new chain. The harness
+  also makes helper calls of its own (`level-summary`, `drain-summary`, ...). Gym's local capture path delivers one
+  chain per rollout; train on all of them with framework-owned reconstruction (`parent_resolution: source_history`,
+  `external_staging: true`, `rebuild_response: false`, see
+  [context compaction](../../fern/versions/latest/pages/model-server/model-call-capture.mdx)).
+- **What the rollout reports** (`ng_agent_observations`, `call_log.py`):
+  - one `agent_invocation` whose `model_calls` are the gameplay calls in order: the accepted calls, as references
+    (model server + response id) to the captured calls;
+  - one `context_compaction` per drain: the gameplay call before and after it, the helper calls that wrote the
+    summary, the summary text, and the prompt tokens before and after (`usage.prompt_tokens`);
+  - gaps: `model_call_failed` for a failed call, `history_rewritten` for a gameplay request that rewrote earlier
+    history without dropping any (also a new chain, not a compaction).
+- The harness marks its calls itself (`_chat_completion`'s `gdn_role` and `gdn_history_id`); the agent wraps that one
+  method to read them. The harness files stay unchanged.
 
 ## Launch on one GB200 / GB300 node
 

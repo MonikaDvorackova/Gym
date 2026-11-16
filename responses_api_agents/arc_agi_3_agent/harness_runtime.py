@@ -30,6 +30,7 @@ The harness reads its settings from the environment once, at import, so one agen
 """
 
 import asyncio
+import collections
 import contextlib
 import datetime as dt
 import functools
@@ -187,6 +188,23 @@ def game_files_sha256(game_dir: Path) -> Dict[str, str]:
     }
 
 
+def install_call_roles(tool_agent_cls: Any, transport: Any) -> None:
+    """Mark every harness model call with its role (``gdn_role``: gameplay or helper, and ``gdn_history_id``) on the
+    transport, which records it in the game's call log. The harness files are unchanged; the method is wrapped once."""
+    original = tool_agent_cls._chat_completion
+    if getattr(original, "_gym_call_roles", False):
+        return
+
+    @functools.wraps(original)
+    def chat_completion(self: Any, *args: Any, **kwargs: Any) -> Any:
+        role = kwargs.get("gdn_role", "gameplay")
+        with transport.call_role(str(role), str(kwargs.get("gdn_history_id", "main"))):
+            return original(self, *args, **kwargs)
+
+    chat_completion._gym_call_roles = True
+    tool_agent_cls._chat_completion = chat_completion
+
+
 class GameStartError(RuntimeError):
     """The attempt could not start (pin mismatch, missing game, engine refused); it has no record."""
 
@@ -205,6 +223,9 @@ class AttemptResult:
     # The attempt's scorecard on the official game server and its game run's guid (what the verifier checks).
     scorecard_id: Optional[str] = None
     guid: Optional[str] = None
+    # The game's own start (UTC ISO) and its transport key (the game's call log).
+    started_at_utc: Optional[str] = None
+    game_key: Optional[str] = None
 
 
 def _abandon_started_game(start: "asyncio.Future[Any]") -> None:
@@ -237,6 +258,8 @@ class HarnessRuntime:
         game_server_url: str,
         api_key: str,
         cancel_drain_s: float = DEPLOYED_CANCEL_DRAIN_S,
+        shared_clock: bool = True,
+        max_actions_per_game: Optional[int] = None,
     ):
         self.install_root = install_root
         # The official arc_agi game server (the scorecard authority) and this run's key on it.
@@ -254,6 +277,12 @@ class HarnessRuntime:
         self.seed = seed
         self.save_every_s = save_every_s
         self.cancel_drain_s = cancel_drain_s
+        # shared_clock (the kit): every game's play ends at the run origin + play_seconds. Otherwise each game has its
+        # own play_seconds from its own start (RL rollouts that start whenever the trainer sends them).
+        self.shared_clock = shared_clock
+        self.max_actions_per_game = max_actions_per_game
+        self._attempts = collections.Counter()
+        self._attempt_serial = 0
         self.solver = None
         self.tool_agent = None
         self.run_config_sha256: Optional[str] = None
@@ -301,6 +330,9 @@ class HarnessRuntime:
         from inference.utils.sandbox_memory import SandboxMemoryPool
 
         tool_agent.requests = requests_proxy
+        transport = getattr(requests_proxy, "_transport", None)
+        if transport is not None:
+            install_call_roles(tool_agent.ToolAgent, transport)
         self.tool_agent = tool_agent
 
         import fast_state
@@ -319,7 +351,7 @@ class HarnessRuntime:
             label="duck-harness",
             model="local",
             analyzer_timeout=DEPLOYED_ANALYZER_TIMEOUT_S,
-            max_actions_per_game=None,
+            max_actions_per_game=self.max_actions_per_game,
             max_runtime_s_per_game=float(self.play_seconds),
             concurrency=int(self.concurrency),
             save_request_logs=bool(self.save_request_logs),
@@ -405,6 +437,7 @@ class HarnessRuntime:
             if self.closed:
                 raise GameStartError("the agent is shutting down")
             origin = dt.datetime.now() if self._start_time is None else None
+            game._gym_started_at = dt.datetime.now().astimezone()
             game.start_game(self._session)
             if game.game_id != full_game_id:
                 raise GameStartError(f"the engine started {game.game_id!r}, not the pinned {full_game_id!r}")
@@ -413,14 +446,15 @@ class HarnessRuntime:
                     # One run clock (the kit's): every game's play window ends at the origin + play_seconds, and
                     # RHAE@T is measured from it. The origin is taken before the first game's server RESET.
                     self._start_time = origin
-                    self.solver.soft_end_time = self._start_time + dt.timedelta(seconds=float(self.play_seconds))
+                    if self.shared_clock:
+                        self.solver.soft_end_time = self._start_time + dt.timedelta(seconds=float(self.play_seconds))
                 self._games.append(game)
         return game
 
-    def _play(self, game: Any, key: str, index: int, transport: Any) -> None:
+    def _play(self, game: Any, key: str, index: int, transport: Any, pass_index: int = 0) -> None:
         transport.bind_game(key)
         try:
-            self.solver._play_one(game, index, 0, None)
+            self.solver._play_one(game, index, pass_index, None)
         finally:
             transport.bind_game(None)
             run = game.game_run
@@ -435,7 +469,9 @@ class HarnessRuntime:
             run.state = "cancelled"
         transport.cancel(key)
 
-    async def play_game(self, verifier_metadata: Dict[str, Any], index: int, transport: Any) -> AttemptResult:
+    async def play_game(
+        self, verifier_metadata: Dict[str, Any], index: int, transport: Any, game_key: Optional[str] = None
+    ) -> AttemptResult:
         """Play one attempt. Raises :class:`GameStartError` when it cannot start; once started, the record is kept
         whatever happens after (play exception, failed snapshot save)."""
         full_game_id = self.check_game_pins(verifier_metadata)
@@ -450,10 +486,15 @@ class HarnessRuntime:
         except Exception as exc:
             raise GameStartError(f"{full_game_id}: {type(exc).__name__}: {exc}") from exc
         self._ensure_saver()
-        key = f"{index}:{full_game_id}"
+        # Repeats of one game (RL groups) get their own pass index (their files: <game>_p<pass>) and transport key.
+        with self._games_lock:
+            pass_index = self._attempts[full_game_id]
+            self._attempts[full_game_id] += 1
+            self._attempt_serial += 1
+            key = game_key or f"{index}:{full_game_id}:{self._attempt_serial}"
         loop = asyncio.get_running_loop()
         future = loop.run_in_executor(
-            self.solver._worker_pool, functools.partial(self._play, game, key, index, transport)
+            self.solver._worker_pool, functools.partial(self._play, game, key, index, transport, pass_index)
         )
         self._inflight[key] = future
         play_error = None
@@ -489,6 +530,12 @@ class HarnessRuntime:
             persistence_error=persistence_error,
             scorecard_id=getattr(game, "_scorecard_id", None),
             guid=game.current_state.raw.guid,
+            started_at_utc=(
+                game._gym_started_at.astimezone(dt.timezone.utc).isoformat()
+                if getattr(game, "_gym_started_at", None) is not None
+                else None
+            ),
+            game_key=key,
         )
 
     def benchmark_json(self) -> Dict[str, Any]:

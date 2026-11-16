@@ -39,6 +39,9 @@ with, and return it as reasoning with empty content; for these requests the prox
 
 Only ``POST .../chat/completions`` is served. Any other POST (an engine-specific endpoint) raises, because the Gym
 model server has no such endpoint.
+
+Every call is recorded in its game's :class:`~responses_api_agents.arc_agi_3_agent.call_log.GameCallLog` with the role
+the harness gave it (``call_role``: ``gameplay``, or ``helper`` with the summary's ``gdn_history_id``).
 """
 
 import asyncio
@@ -47,16 +50,19 @@ import re
 import threading
 import time
 from concurrent.futures import wait as wait_for_future
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from contextlib import contextmanager
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
 import requests
+
+from responses_api_agents.arc_agi_3_agent.call_log import GAMEPLAY_ROLE, GameCallLog
 
 
 THINK_PATTERN = re.compile(r"<think>(.*?)</think>", re.DOTALL)
 # How often a pending model call checks whether its attempt was cancelled.
 CANCEL_POLL_S = 1.0
 
-# Fields of Gym's chat-completion request model (nemo_gym.openai_utils.NeMoGymChatCompletionCreateParamsNonStreaming).
+# Fields of Gym's chat-completion request model (nemo_gym.core.responses_api_types.NeMoGymChatCompletionCreateParamsNonStreaming).
 OPENAI_CHAT_FIELDS = frozenset(
     {
         "messages",
@@ -245,12 +251,12 @@ class GymChatTransport:
     def __init__(
         self,
         loop: asyncio.AbstractEventLoop,
-        post: Callable[[Dict[str, Any], Optional[Dict[str, str]]], Any],
+        post: Callable[[Dict[str, Any], Optional[Dict[str, str]], Optional[str]], Any],
         *,
         chat_template_kwargs: Optional[Dict[str, Any]] = None,
         extra_body: Optional[Dict[str, Any]] = None,
     ):
-        """``post(body, cookies)`` is a coroutine function returning ``(status, text, cookies)``."""
+        """``post(body, cookies, game_key)`` is a coroutine function returning ``(status, text, cookies)``."""
         self._loop = loop
         self._post = post
         self._chat_template_kwargs = dict(chat_template_kwargs or {})
@@ -260,7 +266,28 @@ class GymChatTransport:
         self._cookies_lock = threading.Lock()
         self._cancelled: set = set()
         self._all_cancelled = threading.Event()
+        self._logs: Dict[str, GameCallLog] = {}
+        self._logs_lock = threading.Lock()
         self.requests_sent = 0
+
+    @contextmanager
+    def call_role(self, role: str, history_id: str) -> Iterator[None]:
+        """Mark this thread's calls inside the block with the harness's role for them."""
+        previous = getattr(self._local, "role", None)
+        self._local.role = (role, history_id)
+        try:
+            yield
+        finally:
+            self._local.role = previous
+
+    def call_log(self, game_key: str) -> GameCallLog:
+        with self._logs_lock:
+            return self._logs.setdefault(game_key, GameCallLog())
+
+    def take_call_log(self, game_key: str) -> GameCallLog:
+        """The game's call log, removed from the transport (call once, after the game ended)."""
+        with self._logs_lock:
+            return self._logs.pop(game_key, None) or GameCallLog()
 
     def cancel(self, game_key: str) -> None:
         """Abandon ``game_key``'s pending and future model calls (they raise ``requests.RequestException``)."""
@@ -286,7 +313,7 @@ class GymChatTransport:
         read_timeout = timeout[1] if isinstance(timeout, (tuple, list)) else timeout
         if self._is_cancelled(game_key):
             raise requests.RequestException(f"attempt {game_key} was cancelled; no model call sent")
-        future = asyncio.run_coroutine_threadsafe(self._post(body, cookies), self._loop)
+        future = asyncio.run_coroutine_threadsafe(self._post(body, cookies, game_key), self._loop)
         deadline = None if read_timeout is None else time.monotonic() + float(read_timeout)
         # Wait for the call to finish (polling for cancellation and the deadline), then read its result. The two are
         # separate: an upstream timeout is a TimeoutError stored in a finished future, not a wait that ran out.
@@ -310,6 +337,19 @@ class GymChatTransport:
             with self._cookies_lock:
                 self._cookies[game_key] = dict(new_cookies)
         self.requests_sent += 1
+        if game_key is not None:
+            role, history_id = getattr(self._local, "role", None) or (GAMEPLAY_ROLE, "main")
+            try:
+                parsed = json.loads(text) if status < 400 else None
+            except ValueError:
+                parsed = None
+            self.call_log(game_key).add(
+                role=role,
+                history_id=history_id,
+                messages=payload.get("messages") or [],
+                status=status,
+                response=parsed if isinstance(parsed, dict) else None,
+            )
         return GymHTTPResponse(status, text, url, reasoning_is_content=continues_closed_reasoning(payload))
 
 

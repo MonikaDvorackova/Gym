@@ -292,7 +292,7 @@ class TestClockAndCancel:
 
         asyncio.run(main())
         game = runtime._games[0]
-        assert game.game_run.state == "cancelled" and transport.cancelled == ["3:ls20-v1"]
+        assert game.game_run.state == "cancelled" and transport.cancelled == ["3:ls20-v1:1"]
         assert not runtime.solver._stop_event.is_set() and not runtime._inflight
         assert json.loads((runtime.run_dir / "benchmark.json").read_text())["game_runs"][0]["state"] == "cancelled"
 

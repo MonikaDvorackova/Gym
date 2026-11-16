@@ -22,8 +22,8 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from nemo_gym import PARENT_DIR
-from nemo_gym.config_types import ModelServerRef, ResourcesServerRef
-from nemo_gym.server_utils import ServerClient
+from nemo_gym.client.server_client import ServerClient
+from nemo_gym.config.config_types import ModelServerRef, ResourcesServerRef
 from responses_api_agents.arc_agi_3_agent import app as agent_app
 from responses_api_agents.arc_agi_3_agent.app import (
     ArcAgi3Agent,
@@ -32,6 +32,7 @@ from responses_api_agents.arc_agi_3_agent.app import (
     redact,
     repo_path,
 )
+from responses_api_agents.arc_agi_3_agent.call_log import GameCallLog
 from responses_api_agents.arc_agi_3_agent.harness_runtime import AttemptResult, GameStartError
 
 
@@ -56,7 +57,7 @@ class FakeRuntime:
         self.api_key = "key-1"
         self.calls = []
 
-    async def play_game(self, meta, index, transport):
+    async def play_game(self, meta, index, transport, game_key=None):
         self.calls.append((meta["full_game_id"], index))
         if self.raises:
             raise self.raises
@@ -146,6 +147,69 @@ def test_run_sends_record_to_verifier(monkeypatch: pytest.MonkeyPatch, tmp_path:
     }
     assert result.reward == 0.5 and result.run_dir == "/tmp/arc3-run" and result.run_config_sha256 == "c0ffee"
     assert result.harness == "nvarc3-kaggle-60.95"
+    (invocation,) = result.ng_agent_observations["records"]
+    assert invocation["kind"] == "agent_invocation" and invocation["stop_reason"] == "gave_up"
+    assert invocation["model_calls"] == []
+
+
+def test_run_routes_calls_on_the_rollout_path_and_reports_drains(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Training mode: the game's calls go to its run's rollout path; the result lists the gameplay calls and the drain;
+    with the per-game clock the verifier measures RHAE@T from the game's own start."""
+    agent = make_agent(monkeypatch, tmp_path, run_clock="per_game")
+    monkeypatch.setattr(
+        type(agent), "url_path_for_run", lambda self, path, body: f"/ng-rollout/7-0/training-token-capture{path}"
+    )
+    record = {"state": "not_won", "levels_completed": 1, "history": [{}]}
+    seen = {}
+
+    class Transport:
+        def __init__(self):
+            self.log = GameCallLog()
+
+        def take_call_log(self, key):
+            return self.log
+
+    transport = Transport()
+
+    class Runtime(FakeRuntime):
+        async def play_game(self, meta, index, transport_, game_key=None):
+            seen["path"] = agent._game_url_paths[game_key]
+            system = {"role": "system", "content": "play"}
+            turns = [{"role": "user", "content": f"s{i}"} for i in range(4)]
+            transport.log.add(
+                role="gameplay", history_id="main", messages=[system, *turns], status=200, response={"id": "r0"}
+            )
+            transport.log.add(
+                role="helper", history_id="drain-summary", messages=[system, *turns], status=200, response={"id": "s0"}
+            )
+            transport.log.add(
+                role="gameplay",
+                history_id="main",
+                status=200,
+                response={"id": "r1"},
+                messages=[system, turns[-1], {"role": "user", "content": "[Summary of earlier history]"}],
+            )
+            return AttemptResult(record=record, started_at_utc="2026-11-17T08:00:00+00:00", game_key=game_key)
+
+    agent._runtime, agent._transport = Runtime(), transport
+    sent = {}
+
+    async def post(server_name, url_path, json, cookies=None):
+        sent.update(body=json)
+        return FakeHttpResponse({**json, "reward": 0.1})
+
+    agent.server_client.post = AsyncMock(side_effect=post)
+    result = asyncio.run(agent.run(MagicMock(cookies={}), run_request()))
+    assert seen["path"] == "/ng-rollout/7-0/training-token-capture/v1/chat/completions"
+    assert agent._game_url_paths == {}
+    assert sent["body"]["benchmark_start_time"] == "2026-11-17T08:00:00+00:00"
+    invocation, compaction = result.ng_agent_observations["records"]
+    assert [c["response_id"] for c in invocation["model_calls"]] == ["r0", "r1"]
+    assert compaction["kind"] == "context_compaction"
+    assert [c["response_id"] for c in compaction["model_calls"]] == ["s0"]
+    assert compaction["before_model_call"]["response_id"] == "r0"
 
 
 def test_run_scores_a_game_that_cannot_start(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
