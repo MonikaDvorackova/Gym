@@ -20,12 +20,13 @@ import hashlib
 import json
 import logging
 import re
+import shutil
 import sqlite3
 import sys
 import tempfile
 from asyncio import Semaphore
-from collections.abc import Iterator
-from contextlib import contextmanager, nullcontext
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager, nullcontext
 from copy import deepcopy
 from functools import cache
 from pathlib import Path
@@ -574,7 +575,9 @@ class OpenCodeSandboxedAgentConfig(BaseResponsesAPIAgentConfig):
     output_token_policy: Literal["fixed", "remaining_context"] = "fixed"
     network_access: Literal["inherit", "model_only", "model_and_tools"] = "inherit"
     tool_servers: List[ResourcesServerRef] = Field(default_factory=list)
-    # Keeps each session's OpenCode export here. None uses a temporary folder, removed after the run.
+    # Keeps each session's OpenCode export under <artifacts_dir>/<session_id>/ for debugging.
+    # None, the default, downloads it into a temporary folder that is removed once it is parsed.
+    # That folder is also removed when the rollout ends early, through an error, a timeout or a cancellation.
     artifacts_dir: Optional[str] = None
     opencode_model_call_timeout: Optional[int] = None
 
@@ -654,20 +657,30 @@ def _extract_opencode_session_id(session_list_stdout: str) -> str:
     return session_id
 
 
-@contextmanager
-def _opencode_results_dir(artifacts_dir: Optional[str], session_id: str) -> Iterator[Path]:
+@asynccontextmanager
+async def _opencode_results_dir(artifacts_dir: Optional[str], session_id: str) -> AsyncIterator[Path]:
     """Yield the folder for one session's OpenCode export and database snapshot.
 
     With ``artifacts_dir`` the folder is ``<artifacts_dir>/<session_id>`` and is kept.
-    Without it the folder is a new temporary one, removed on exit, so nothing is written next to this module.
+    Without it the folder is a new temporary one, removed on exit, including on an error or a cancellation.
     """
     if artifacts_dir:
         results_dir = Path(artifacts_dir) / session_id
-        results_dir.mkdir(parents=True, exist_ok=True)
+        await asyncio.to_thread(results_dir.mkdir, parents=True, exist_ok=True)
         yield results_dir
-    else:
-        with TemporaryDirectory(prefix="opencode-results-") as tmp:
-            yield Path(tmp)
+        return
+    # Shielded so that a cancellation cannot abandon a folder the worker thread has already created.
+    with CancelScope(shield=True):
+        results_dir = Path(await asyncio.to_thread(tempfile.mkdtemp, prefix="opencode-results-"))
+    try:
+        yield results_dir
+    finally:
+        # The anyio cancellation is re-delivered at every await, so an unshielded removal would be cancelled too.
+        with CancelScope(shield=True):
+            try:
+                await asyncio.to_thread(shutil.rmtree, results_dir)
+            except OSError:
+                LOGGER.warning("Could not remove the OpenCode export folder %s", results_dir, exc_info=True)
 
 
 def _read_opencode_child_messages(db_path: Path, root_session_id: str) -> list[dict[str, Any]]:
@@ -1566,7 +1579,7 @@ class OpenCodeSandboxedAgent(SimpleResponsesAPIAgent):
         # diff`, which would sweep this transcript into the patch.
         export_remote_fpath = f"/tmp/opencode_{export_fname}"
         # Without artifacts_dir the export and snapshot go to a temporary folder, removed once they are parsed.
-        with _opencode_results_dir(self.config.artifacts_dir, request.session[SESSION_ID_KEY]) as results_dir:
+        async with _opencode_results_dir(self.config.artifacts_dir, request.session[SESSION_ID_KEY]) as results_dir:
             results_local_fpath = results_dir / export_fname
             # A previous attempt's transcript must never stand in for this run's export.
             results_local_fpath.unlink(missing_ok=True)
