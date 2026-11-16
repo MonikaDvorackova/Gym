@@ -1,0 +1,13 @@
+-e nemo-gym[dev] @ ../../
+# AF3's ARC-AGI-3 window environment (agent_factory_3.envs.arc3, put on sys.path by setup_af3.py) and the duck harness
+arc-agi==0.9.9
+arcengine==0.9.3
+numpy>=2.2
+pyarrow>=25.0.1
+pillow>=11
+matplotlib>=3.10
+scipy>=1.10
+imageio>=2.34
+requests>=2.32
+zstandard>=0.25
+# arc_agi also imports flask, which nemo-gym's uv exclude-dependencies drops: setup_arc_agi.ensure_flask() installs it

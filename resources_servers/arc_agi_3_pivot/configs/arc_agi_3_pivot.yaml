@@ -1,0 +1,23 @@
+config_paths:
+  - responses_api_agents/arc_agi_3_pivot_agent/configs/arc_agi_3_pivot_agent.yaml
+
+arc_agi_3_pivot_resources_server:
+  resources_servers:
+    arc_agi_3_pivot:
+      entrypoint: app.py
+      domain: games
+      verified: false
+      description: "ARC-AGI-3 pivot windows (PivotRL): restore a recorded game state with its live Python sandbox and play a few calls; reward = oracle-distance progress."
+      value: Train exploration and planning in interactive games from recorded decision points.
+      # The AF3 pool directory (games.parquet, env/, snap/, snap-raw/), e.g. a copy of <af3 root>/data/exact30d2-20261111c/pub25.
+      pool_dir: ???
+      # null = the pinned trees setup_af3.py installs under resources_servers/arc_agi_3_pivot/.af3/
+      af3_src: null
+      harness_base: null
+      max_calls: 24
+      af3_env:
+        AF3_EXACT_HOST: "1"
+        AF3_EXACT_FORK_GROUP: "1"
+      # Read-ahead: the dataset the rollouts come from, and how many following rows to restore ahead of each seed.
+      prefetch_dataset: null
+      prefetch_lookahead: 0
