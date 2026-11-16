@@ -799,7 +799,7 @@ _gym_service_exited() {{
     # A successful run tears its services down as the driver ends: if the driver is already gone, its status stands.
     # Once the evaluation has succeeded (a driver with exports writes the marker then), a service that is lost
     # costs nothing the exports need, so the driver is left to finish and its status stands.
-    if [ -e "${{GYM_EVAL_SUCCEEDED_MARKER:-}}" ] || ! kill -0 "$_gym_driver_pid" 2>/dev/null; then
+    if [ -e "${{GYM_EVAL_SUCCEEDED_MARKER:-}}" ] || ! kill -0 "$_gym_driver_pid" 2>/dev/null; then{settled}
         wait "$_gym_driver_pid"
         return
     fi
@@ -819,6 +819,13 @@ _gym_run_driver() {{
 }}
 _gym_run_driver"""
 
+# The services are no longer watched, but the extra check keeps its poll until the driver ends.
+_SETTLED_EXTRA_CHECK = """
+        while kill -0 "$_gym_driver_pid" 2>/dev/null; do
+            {extra_check}
+            sleep 5
+        done"""
+
 
 def _render_watched_driver(driver: str, services: list[str], extra_check: str = "") -> str:
     """The driver step, ended with TERM if a service it depends on exits first.
@@ -830,7 +837,8 @@ def _render_watched_driver(driver: str, services: list[str], extra_check: str = 
     `GYM_EVAL_SUCCEEDED_MARKER` as soon as the evaluation succeeds, and from then on a lost service no
     longer ends the driver: the exports do not use it, and a requeue would reload the model for nothing.
     The driver's PID is kept in a lowercase variable, which no service's uppercase <NAME>_PID can overwrite.
-    `extra_check` is one more line the loop runs on every poll.
+    `extra_check` is one more line the loop runs on every poll, also after a service is lost once the evaluation has
+    succeeded.
     """
     if not services and not extra_check:
         return driver
@@ -841,7 +849,8 @@ def _render_watched_driver(driver: str, services: list[str], extra_check: str = 
         ]
         + ([f"        {extra_check}"] if extra_check else [])
     )
-    return _WATCHED_DRIVER_TEMPLATE.format(driver=driver, checks=checks)
+    settled = _SETTLED_EXTRA_CHECK.format(extra_check=extra_check) if extra_check else ""
+    return _WATCHED_DRIVER_TEMPLATE.format(driver=driver, checks=checks, settled=settled)
 
 
 def _pool_offsets(compute: SlurmComputeConfig) -> dict[str, tuple[int, int]]:
@@ -1160,6 +1169,7 @@ def build_sbatch_script(
         gym_cmd = ""
         driver_env |= _command_env(benchmark, remote_bench_dir)
     exports = effective_exports(config, benchmark_name)
+    node_local = benchmark.node_local_config
     export_tail = (
         render_export_tail(
             remote_bench_dir,
@@ -1178,6 +1188,7 @@ def build_sbatch_script(
                 )
                 for name, settings in exports.items()
             ],
+            archive_wait_seconds=node_local_script.archive_wait_seconds(node_local) if node_local else None,
         )
         if exports
         else None
@@ -1225,12 +1236,11 @@ def build_sbatch_script(
     # the host, which is what makes the loss so easy to miss.
     driver_mounts = [*config.driver.mounts, f"{remote_bench_dir}:{remote_bench_dir}"]
     driver_mounts_flag = f" --container-mounts={','.join(shlex.quote(m) for m in driver_mounts)}"
-    node_local = benchmark.node_local_config
     # Empty when the batch shell runs on the driver's node, which is node 0.
     node_local_flags = driver_node_flags if driver_node else ""
     driver_srun = (
         f"{driver_env_prefix}{failure_file}"
-        f"{node_local_script.driver_env_prefix(remote_bench_dir) if node_local else ''}"
+        f"{node_local_script.driver_env_prefix(remote_bench_dir, exports=export_tail is not None) if node_local else ''}"
         f"srun --overlap --no-container-mount-home{driver_node_flags}{driver_mounts_flag}"
         f"{',' + node_local_script.driver_mount(remote_bench_dir) if node_local else ''}"
         f" --container-image={shlex.quote(config.driver.container)} "
@@ -1279,11 +1289,13 @@ def build_sbatch_script(
     driver_command = (
         marker_definition
         + (f"{gym_cmd}\n" if gym_cmd else "")
-        + _render_watched_driver(driver_srun, watched, node_local_script.DEADLINE_CHECK if node_local else "")
+        + _render_watched_driver(driver_srun, watched, node_local_script.WATCH_CHECK if node_local else "")
     )
     if node_local:
         driver_command = (
-            node_local_script.render_setup(node_local, remote_bench_dir, node_local_flags)
+            node_local_script.render_setup(
+                node_local, remote_bench_dir, node_local_flags, exports=export_tail is not None
+            )
             + "\n"
             + driver_command
             + "\n"

@@ -464,7 +464,7 @@ class ResumeConfig(_StrictModel):
 # How long the job waits for a driver step it stopped before the time limit to end, before it archives anyway.
 NODE_LOCAL_STOP_WAIT_SECONDS = 60
 # A host path that is safe in a pyxis mount list (no comma or colon) and in an unquoted shell word.
-_NODE_LOCAL_BASE_DIR_RE = re.compile(r"^/[A-Za-z0-9._/-]+$")
+_NODE_LOCAL_BASE_DIR_RE = re.compile(r"/[A-Za-z0-9._/-]+")
 
 
 class NodeLocalConfig(_StrictModel):
@@ -476,8 +476,8 @@ class NodeLocalConfig(_StrictModel):
 
     # The host directory each Slurm job gets its own `gym-node-local-<SLURM_JOB_ID>` under. It must be node-local.
     base_dir: str = "/tmp"
-    # Extract the newest earlier archive before the driver starts, so each archive holds the run's whole dir and only
-    # the newest two are kept. Off suits files nothing reads back: each archive holds its own job's files, all kept.
+    # Extract the newest earlier archive that extracts before the driver starts; each archive then holds the run's
+    # whole dir, kept with the one it came from. Off suits files nothing reads back: each archive holds one job's.
     restore: bool = True
     # Bound on writing one archive.
     archive_timeout_seconds: int = Field(default=120, gt=0)
@@ -488,7 +488,8 @@ class NodeLocalConfig(_StrictModel):
     @field_validator("base_dir")
     @classmethod
     def _validate_base_dir(cls, value: str) -> str:
-        if not _NODE_LOCAL_BASE_DIR_RE.match(value) or "/../" in f"{value}/":
+        # fullmatch: `$` would also match before a trailing newline, which would split the rendered path.
+        if not _NODE_LOCAL_BASE_DIR_RE.fullmatch(value) or "/../" in f"{value}/":
             raise ValueError(
                 f"node_local.base_dir must be an absolute path of letters, digits, '.', '_', '-' and '/', got {value!r}"
             )
