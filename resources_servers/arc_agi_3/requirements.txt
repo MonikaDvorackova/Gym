@@ -1,0 +1,4 @@
+-e nemo-gym[dev] @ ../../
+arc-agi==0.9.8
+arcengine==0.9.3
+# arc_agi also imports flask, which nemo-gym's uv exclude-dependencies drops: setup_arc_agi.ensure_flask() installs it

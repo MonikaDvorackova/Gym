@@ -1,0 +1,443 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""ARC-AGI-3 agent: plays one game per ``/run`` with the NVARC3 Kaggle harness (public LB 60.95).
+
+The harness is the pinned, unmodified ``duck-harness`` build of Kaggle submission 57908411 (see
+``harness_manifest.json`` and ``setup_harness.py``). Its model calls go to the Gym model server
+(``gym_transport.py``). Each ``/run`` plays the row's game for up to ``play_seconds`` and sends the taaf game record to
+the ``arc_agi_3`` resources server, which scores it (RHAE).
+
+All harness settings are process-wide (the harness reads them once from the environment), so one agent server is one
+hyperparameter configuration. Run the rows of one evaluation concurrently (concurrency >= rows) so that every game
+gets the same play window, as in the kit.
+"""
+
+import asyncio
+import datetime as dt
+import json
+import logging
+import re
+from contextlib import asynccontextmanager
+from pathlib import Path
+from time import time
+from typing import Any, Dict, Optional, Tuple
+from uuid import uuid4
+
+from fastapi import Body, FastAPI, Request, Response
+from omegaconf import OmegaConf
+from pydantic import ConfigDict, Field
+
+from nemo_gym import PARENT_DIR
+from nemo_gym.base_resources_server import BaseRunRequest, BaseVerifyResponse
+from nemo_gym.base_responses_api_agent import BaseResponsesAPIAgentConfig, SimpleResponsesAPIAgent
+from nemo_gym.config_types import AggregateMetrics, AggregateMetricsRequest, ModelServerRef, ResourcesServerRef
+from nemo_gym.global_config import get_first_server_config_dict
+from nemo_gym.openai_utils import (
+    NeMoGymResponse,
+    NeMoGymResponseCreateParamsNonStreaming,
+    NeMoGymResponseOutputMessage,
+    NeMoGymResponseOutputText,
+)
+from nemo_gym.server_utils import get_response_json, raise_for_status, request
+from resources_servers.arc_agi_3.setup_arc_agi import ensure_flask
+from responses_api_agents.arc_agi_3_agent.gym_transport import GymChatTransport, RequestsProxy
+from responses_api_agents.arc_agi_3_agent.harness_runtime import (
+    GameStartError,
+    HarnessRuntime,
+    compose_harness_env,
+    game_files_sha256,
+    load_harness_env_toml,
+)
+from responses_api_agents.arc_agi_3_agent.setup_harness import DEFAULT_DEST, ensure_harness, load_manifest
+
+
+LOG = logging.getLogger(__name__)
+# The rows' "harness" value (the official option's rows say "official").
+HARNESS_NAME = "nvarc3-kaggle-60.95"
+
+
+def repo_path(path: str) -> Path:
+    """A config path; relative paths are relative to the Gym repository root (servers run in their own dir)."""
+    return Path(path) if Path(path).is_absolute() else PARENT_DIR / path
+
+
+# Whole keys that hold credentials (``api_key``, ``hf_token``, ``Authorization``, ...), not settings that merely
+# mention tokens (``max_tokens``, ``thinking_token_budget``, ``context_keep_tokens``).
+SECRET_KEY_PATTERN = re.compile(
+    r"^(?:.*[_-])?(?:api_?key|access_?token|auth_?token|refresh_?token|token|secret(?:_?key)?|password|passwd|"
+    r"authorization|cookies?|credentials?|bearer)$",
+    re.I,
+)
+
+
+def redact(value: Any) -> Any:
+    """A JSON-able copy without credentials: secret-looking keys, URL user info and secret query parameters."""
+    if isinstance(value, dict):
+        return {
+            str(k): ("REDACTED" if SECRET_KEY_PATTERN.search(str(k)) and v not in (None, "") else redact(v))
+            for k, v in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [redact(v) for v in value]
+    if isinstance(value, str) and "://" in value:
+        value = re.sub(r"://[^/@\s]*@", "://REDACTED@", value)
+        return re.sub(
+            r"([?&](?:[^=&]*[_-])?(?:key|token|secret|sig|signature)=)[^&]*", r"\1REDACTED", value, flags=re.I
+        )
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
+
+
+class ArcAgi3AgentConfig(BaseResponsesAPIAgentConfig):
+    resources_server: ResourcesServerRef
+    model_server: ModelServerRef
+
+    # Harness install: a verified directory (default: .arc3_harness next to this file), installed on first start
+    # from harness_source (directory, .tar.gz, or kaggle:<owner>/<prefix>).
+    harness_dir: Optional[str] = None
+    harness_source: Optional[str] = None
+    # The ARC-AGI-3 environment files (<game>/<version>/...), the same directory as the resources server's.
+    environments_dir: str
+    # Run outputs: <output_dir>/<run_name>/{benchmark.json, transcripts/, artifacts/, telemetry/, harness_env.json}.
+    output_dir: str = "results/arc_agi_3"
+    run_name: Optional[str] = None
+
+    # Play budget per game (seconds from the game's start; the kit's public25 mode plays 7200 s).
+    play_seconds: float = 7200.0
+    # Games played at once (harness worker threads) and attempts sharing the sandbox memory pool.
+    concurrency: int = 25
+    num_attempts: int = 25
+
+    # Hyperparameters. None keeps the deployed harness_env.toml value (the 60.95 run):
+    # temperature 0.7, top_p 0.95, top_k 20, thinking on, max output 12288, context window 131072, keep 24576.
+    temperature: Optional[float] = None
+    top_p: Optional[float] = None
+    top_k: Optional[int] = None
+    # Seed of the harness's Python ``random``. Seed the engine with the model server's own seed (vLLM --seed).
+    seed: Optional[int] = None
+    # Sampling seed sent with EVERY request (LOCAL_ANALYZER_SEED). Off as deployed: the harness re-sends a rolled-back
+    # turn's request after a failure, and a fixed per-request seed returns the same reply to it.
+    request_seed: Optional[int] = None
+    enable_thinking: Optional[bool] = None
+    # Output cap per request. A reply cut off inside its reasoning is closed and continued to a tool call by the
+    # harness (ARC3_FORCE_ACT), so this is also the reasoning-token cap.
+    max_output_tokens: Optional[int] = None
+    context_window_tokens: Optional[int] = None
+    context_keep_tokens: Optional[int] = None
+    # Any other harness switch (name -> value), applied last.
+    harness_env: Dict[str, Any] = Field(default_factory=dict)
+    # Extra chat-template kwargs sent with every request (the harness's own, e.g. enable_thinking, win). Model-specific
+    # defaults belong in the model server config (e.g. Nemotron's truncate_history_thinking: false).
+    chat_template_kwargs: Dict[str, Any] = Field(default_factory=dict)
+    # Extra vLLM request fields sent with every request.
+    extra_body: Dict[str, Any] = Field(default_factory=dict)
+
+    # The policy model server must return the engine's context-length 400 (vllm_model
+    # propagate_context_overflow_errors: true) so the harness can trim its history and retry; checked at start.
+    # Set False only for a model server without that option, accepting that a rejected request becomes an empty turn.
+    require_context_error_passthrough: bool = True
+
+    save_request_logs: bool = False
+    # Kit step 23 installs: bounded harness RAM (needs glibc), gate telemetry events.
+    mem_lean: bool = True
+    telemetry: bool = True
+    # benchmark.json is rewritten this often during play (the kit's lean diagnostics) and at every game end.
+    save_every_s: float = 600.0
+
+
+class ArcAgi3AgentRunRequest(BaseRunRequest):
+    model_config = ConfigDict(extra="allow")
+
+    verifier_metadata: Dict[str, Any]
+
+
+class ArcAgi3AgentVerifyResponse(BaseVerifyResponse):
+    model_config = ConfigDict(extra="allow")
+
+
+class ArcAgi3Agent(SimpleResponsesAPIAgent):
+    config: ArcAgi3AgentConfig
+
+    def model_post_init(self, context: Any) -> None:
+        ensure_flask()
+        if self.config.num_workers not in (None, 1):
+            raise ValueError("the agent keeps its harness runtime and games in one process; num_workers must be 1")
+        source = self.config.harness_source
+        if source and not source.startswith("kaggle:"):
+            source = str(repo_path(source))
+        self._install_root = ensure_harness(
+            source, repo_path(self.config.harness_dir) if self.config.harness_dir else DEFAULT_DEST
+        )
+        self._runtime: Optional[HarnessRuntime] = None
+        self._transport: Optional[GymChatTransport] = None
+        self._runtime_lock = asyncio.Lock()
+        # The runtime's start, owned by the agent (not by the request that triggered it), and the shutdown flag.
+        self._runtime_start: Optional[asyncio.Future] = None
+        self._closing = False
+        return super().model_post_init(context)
+
+    def setup_webserver(self) -> FastAPI:
+        app = super().setup_webserver()
+        inner_lifespan = app.router.lifespan_context
+
+        @asynccontextmanager
+        async def lifespan(app_: FastAPI):
+            async with inner_lifespan(app_) as state:
+                yield state
+            await self.shutdown()
+
+        app.router.lifespan_context = lifespan
+        return app
+
+    async def shutdown(self) -> None:
+        """Stop and finalize every game (records end as cancelled), last snapshot, close the solver. A runtime that is
+        still starting is waited for first (its start runs in a thread and cannot be interrupted), then closed."""
+        self._closing = True
+        start = self._runtime_start
+        if start is not None and not start.done():
+            await asyncio.wait([start])
+        if self._runtime is not None and self._transport is not None:
+            await self._runtime.shutdown(self._transport)
+
+    def hyperparameters(self) -> Dict[str, Any]:
+        c = self.config
+        return {
+            "temperature": c.temperature,
+            "top_p": c.top_p,
+            "top_k": c.top_k,
+            "request_seed": c.request_seed,
+            "enable_thinking": c.enable_thinking,
+            "max_output_tokens": c.max_output_tokens,
+            "context_window_tokens": c.context_window_tokens,
+            "context_keep_tokens": c.context_keep_tokens,
+        }
+
+    def run_dir(self) -> Path:
+        name = self.config.run_name or dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+        return repo_path(self.config.output_dir) / name
+
+    async def _post_model(self, body: Dict[str, Any], cookies: Optional[Dict[str, str]]) -> Tuple[int, str, Dict]:
+        response = await self.server_client.post(
+            server_name=self.config.model_server.name,
+            url_path="/v1/chat/completions",
+            json=body,
+            cookies=cookies,
+        )
+        text = (await response.read()).decode("utf-8", errors="replace")
+        return response.status, text, {k: m.value for k, m in response.cookies.items()}
+
+    def model_server_config(self) -> Dict[str, Any]:
+        config = get_first_server_config_dict(self.server_client.global_config_dict, self.config.model_server.name)
+        if OmegaConf.is_config(config):
+            return OmegaConf.to_container(config, resolve=True)
+        return dict(config)
+
+    async def observed_engine(self, model_config: Dict[str, Any]) -> Dict[str, Any]:
+        """What the engine behind the model server reports (``/v1/models``: served name, max_model_len)."""
+        urls = model_config.get("base_url")
+        url = (urls[0] if isinstance(urls, (list, tuple)) else urls) or ""
+        if not url:
+            return {"error": "the model server config has no base_url"}
+        try:
+            response = await request("GET", url.rstrip("/") + "/models")
+            models = (await get_response_json(response)).get("data") or []
+            return {"models": [{k: m.get(k) for k in ("id", "root", "max_model_len")} for m in models]}
+        except Exception as exc:  # recorded, not fatal: the run config says the engine could not be read
+            return {"error": f"{type(exc).__name__}: {exc}"}
+
+    async def run_config(self, env: Dict[str, str], model_config: Dict[str, Any]) -> Dict[str, Any]:
+        manifest = load_manifest()
+        environments_dir = repo_path(self.config.environments_dir)
+        games = {}
+        for meta_path in sorted(environments_dir.glob("*/*/metadata.json")):
+            games[meta_path.parent.parent.name] = {
+                "version": meta_path.parent.name,
+                "files_sha256": game_files_sha256(meta_path.parent),
+            }
+        return redact(
+            {
+                "agent": self.config.model_dump(mode="json"),
+                "seed_semantics": "seed = harness Python random; request_seed = LOCAL_ANALYZER_SEED on every request "
+                "(None = unset); engine seed = the model server's own (vllm --seed)",
+                "transport": {
+                    "chat_template_kwargs": self.config.chat_template_kwargs,
+                    "extra_body": self.config.extra_body,
+                },
+                "harness_env": env,
+                "harness": {"install_root": str(self._install_root), "provenance": manifest["provenance"]},
+                "model_server": {"name": self.config.model_server.name, "config": model_config},
+                "engine_observed": await self.observed_engine(model_config),
+                "environments": {"dir": str(environments_dir), "games": games},
+                "written_at": dt.datetime.now().isoformat(),
+            }
+        )
+
+    async def _ensure_runtime(self) -> HarnessRuntime:
+        """The server's one runtime. Its start is a task of the agent: a request cancelled during the start leaves it
+        running, the next request waits for the same start, and shutdown waits for it and closes the runtime."""
+        async with self._runtime_lock:
+            if self._closing:
+                raise RuntimeError("the agent server is shutting down; no new games")
+            if self._runtime is not None:
+                return self._runtime
+            start = self._runtime_start
+            if start is None or start.done():  # the first request, or the previous start failed
+                start = self._runtime_start = asyncio.ensure_future(self._start_runtime())
+        return await asyncio.shield(start)
+
+    async def _start_runtime(self) -> HarnessRuntime:
+        model_config = self.model_server_config()
+        if (
+            self.config.require_context_error_passthrough
+            and model_config.get("propagate_context_overflow_errors") is not True
+        ):
+            raise RuntimeError(
+                f"model server {self.config.model_server.name!r} must set propagate_context_overflow_errors: true "
+                "(vllm_model) so a context-length rejection reaches the harness's trim-and-retry; or set "
+                "require_context_error_passthrough: false on the agent"
+            )
+        loop = asyncio.get_running_loop()
+        transport = GymChatTransport(
+            loop,
+            self._post_model,
+            chat_template_kwargs=self.config.chat_template_kwargs,
+            extra_body=self.config.extra_body,
+        )
+        base_url = self.resolve_model_base_url(self.config.model_server.name)
+        game_server = await self.server_client.get(
+            server_name=self.config.resources_server.name, url_path="/game_server"
+        )
+        await raise_for_status(game_server)
+        game_server_url = (await get_response_json(game_server))["url"]
+        env = compose_harness_env(
+            load_harness_env_toml(self._install_root),
+            base_url=base_url,
+            model_id=self.config.model_server.name,
+            hyperparameters=self.hyperparameters(),
+            overrides=self.config.harness_env,
+        )
+        runtime = HarnessRuntime(
+            install_root=self._install_root,
+            environments_dir=repo_path(self.config.environments_dir).resolve(),
+            run_dir=self.run_dir().resolve(),
+            env=env,
+            play_seconds=self.config.play_seconds,
+            concurrency=self.config.concurrency,
+            num_attempts=self.config.num_attempts,
+            save_request_logs=self.config.save_request_logs,
+            mem_lean=self.config.mem_lean,
+            telemetry=self.config.telemetry,
+            seed=self.config.seed,
+            save_every_s=self.config.save_every_s,
+            game_server_url=game_server_url,
+            api_key=f"arc3-{uuid4().hex}",
+        )
+        run_config = await self.run_config(env, model_config) | {"game_server": game_server_url}
+        try:
+            await asyncio.to_thread(runtime.start, RequestsProxy(transport), run_config)
+        except Exception:
+            await asyncio.to_thread(runtime.abort_start)  # tear down what the failed start already built
+            raise
+        LOG.info("ARC-AGI-3 harness started: run dir %s", runtime.run_dir)
+        self._transport, self._runtime = transport, runtime
+        return runtime
+
+    def _attempt_response(self, body: ArcAgi3AgentRunRequest, record: Optional[Dict[str, Any]]) -> NeMoGymResponse:
+        """A one-message Responses API record of the attempt (the full transcript is in the run directory)."""
+        summary = {
+            "game_id": body.verifier_metadata.get("game_id"),
+            "state": (record or {}).get("state", "not_started"),
+            "levels_completed": (record or {}).get("levels_completed", 0),
+            "actions": len((record or {}).get("history") or []),
+            "run_dir": str(self._runtime.run_dir) if self._runtime else None,
+        }
+        params = body.responses_create_params
+        return NeMoGymResponse(
+            id=f"resp_{uuid4().hex}",
+            created_at=int(time()),
+            model=self.config.model_server.name,
+            object="response",
+            output=[
+                NeMoGymResponseOutputMessage(
+                    id=f"msg_{uuid4().hex}",
+                    content=[NeMoGymResponseOutputText(text=json.dumps(summary), annotations=[])],
+                )
+            ],
+            tool_choice=params.tool_choice if params.tool_choice is not None else "auto",
+            tools=params.tools or [],
+            parallel_tool_calls=params.parallel_tool_calls if params.parallel_tool_calls is not None else True,
+        )
+
+    async def responses(
+        self, request: Request, response: Response, body: NeMoGymResponseCreateParamsNonStreaming = Body()
+    ) -> NeMoGymResponse:
+        model_response = await self.server_client.post(
+            server_name=self.config.model_server.name,
+            url_path="/v1/responses",
+            json=body,
+            cookies=request.cookies,
+        )
+        await raise_for_status(model_response)
+        return NeMoGymResponse.model_validate(await get_response_json(model_response))
+
+    async def run(self, request: Request, body: ArcAgi3AgentRunRequest) -> ArcAgi3AgentVerifyResponse:
+        runtime = await self._ensure_runtime()
+        meta = body.verifier_metadata
+        record, agent_error, persistence_error, solver_note = None, None, None, None
+        scorecard_id, guid = None, None
+        try:
+            attempt = await runtime.play_game(meta, int(meta.get("dispatch_index", 0)), self._transport)
+            record, agent_error = attempt.record, attempt.play_error
+            persistence_error, solver_note = attempt.persistence_error, attempt.solver_note
+            scorecard_id, guid = attempt.scorecard_id, attempt.guid
+        except GameStartError as exc:  # never started: no record, scored as not started
+            LOG.error("ARC-AGI-3 game %s could not start: %s", meta.get("game_id"), exc)
+            agent_error = f"GameStartError: {exc}"
+        verify_body = body.model_dump() | {
+            "response": self._attempt_response(body, record).model_dump(),
+            "game_record": record,
+            "scorecard_id": scorecard_id,
+            "game_guid": guid,
+            "scorecard_api_key": runtime.api_key,
+            "agent_error": agent_error,
+            "persistence_error": persistence_error,
+            "solver_note": solver_note,
+            "benchmark_start_time": runtime.start_time_utc,
+        }
+        verify_response = await self.server_client.post(
+            server_name=self.config.resources_server.name,
+            url_path="/verify",
+            json=verify_body,
+            cookies=request.cookies,
+        )
+        await raise_for_status(verify_response)
+        result = await get_response_json(verify_response)
+        result["run_dir"] = str(runtime.run_dir)
+        result["run_config_sha256"] = runtime.run_config_sha256
+        result["harness"] = HARNESS_NAME
+        return ArcAgi3AgentVerifyResponse.model_validate(result)
+
+    async def aggregate_metrics(self, body: AggregateMetricsRequest = Body()) -> AggregateMetrics:
+        """The resources server's RHAE metrics (overall, at 1 h / 2 h, counts of invalid results)."""
+        response = await self.server_client.post(
+            server_name=self.config.resources_server.name, url_path="/aggregate_metrics", json=body
+        )
+        await raise_for_status(response)
+        return AggregateMetrics.model_validate(await get_response_json(response))
+
+
+if __name__ == "__main__":
+    ArcAgi3Agent.run_webserver()
