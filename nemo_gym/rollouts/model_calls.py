@@ -88,16 +88,21 @@ def observability_enabled_from_config(global_config_dict: Any) -> bool:
     return ModelCallCaptureConfig.model_validate(global_config_dict).observability_enabled
 
 
-# How long a reader waits for writes already claimed by the model server to land. A claimed
-# write is one append + fsync, so this only ever elapses when the writer died holding a claim.
+# How long a reader waits for writes already claimed by the model server to land. A claim spans its
+# call, so this elapses for a cancelled call still generating or a writer that died holding a claim.
 CAPTURE_DRAIN_TIMEOUT_S = 10.0
 _CAPTURE_DRAIN_POLL_S = 0.05
+_CAPTURE_DRAIN_MAX_POLL_S = 1.0
 
 
 def _store_for_rollout(rollout_id: str, capture_dirs: list[Path]) -> Optional[CaptureStore]:
     for directory in capture_dirs:
         store = CaptureStore(directory)
-        if store.path_for(rollout_id).exists() or store.is_incomplete(rollout_id) or store.has_pending(rollout_id):
+        if (
+            store.path_for(rollout_id).exists()
+            or store.is_incomplete(rollout_id)
+            or store.claims_path_for(rollout_id).exists()
+        ):
             return store
     return None
 
@@ -134,26 +139,37 @@ async def await_model_call_capture_quiescence(
                 timeout_s,
             )
             return False
-        await asyncio.sleep(poll_s)
+        # Backs off, since a claim that outlives the first polls usually belongs to a call still generating.
+        await asyncio.sleep(max(0.0, min(poll_s, deadline - time.monotonic())))
+        poll_s = min(poll_s * 2, _CAPTURE_DRAIN_MAX_POLL_S)
 
 
-def clear_model_call_captures_for_rollouts(records: list[Any], capture_dirs: list[Path]) -> None:
+def clear_model_call_captures_for_rollouts(
+    records: list[Any], capture_dirs: list[Path], *, before_dispatch: bool = True
+) -> None:
     """Remove stale per-rollout capture files for these records before dispatch.
 
     Capture files are keyed by a deterministic rollout id (task-rollout-attempt), so without this a
     fresh run or a kill-shaped retry would append onto the previous attempt's capture for the same
     id. The caller passes only rows about to be dispatched, after assigning any retry suffix.
+    Before dispatch, claims and older releases' pending markers of these ids go too, with one listing of
+    each dir per call. After a snapshot (``before_dispatch=False``) claims go only once settled, and
+    nothing is listed.
     """
     if not capture_dirs:
         return
+    rollout_ids = {rollout_id for record in records if (rollout_id := maybe_rollout_id_from_run_body(record))}
     for directory in capture_dirs:
         store = CaptureStore(directory)
-        for record in records:
-            rollout_id = maybe_rollout_id_from_run_body(record)
-            if rollout_id:
-                store.path_for(rollout_id).unlink(missing_ok=True)
-                store.incomplete_path_for(rollout_id).unlink(missing_ok=True)
+        for rollout_id in rollout_ids:
+            store.path_for(rollout_id).unlink(missing_ok=True)
+            store.incomplete_path_for(rollout_id).unlink(missing_ok=True)
+            if before_dispatch:
                 store.clear_all_pending(rollout_id)
+            else:
+                store.retire_claims_if_settled(rollout_id)
+        if before_dispatch and rollout_ids:
+            store.remove_pending_markers(rollout_ids)
 
 
 def merge_model_call_capture_into_record(
@@ -166,7 +182,8 @@ def merge_model_call_capture_into_record(
     ``ng_model_call_capture = {rollout_id, metrics, calls}`` where ``calls`` are derived observability
     records. Raw request and response payloads remain in the capture store and are omitted from the
     attachment unless ``include_payloads`` is true. Capture/read/join failures are attached as
-    ``gaps``. The harness output and reward are not modified.
+    ``gaps``. The harness output and reward are not modified. A rollout with no outstanding claim
+    has its claims file removed.
     """
     if not capture_dirs:
         return record
@@ -189,7 +206,7 @@ def merge_model_call_capture_into_record(
                         detail=f"count={invalid_count}",
                     )
                 )
-            if store.has_pending(rollout_id):
+            if not store.retire_claims_if_settled(rollout_id):
                 gaps.append(ObservationGap(code="model_call_capture_pending"))
             if store.is_incomplete(rollout_id):
                 gaps.append(ObservationGap(code="model_call_capture_incomplete"))

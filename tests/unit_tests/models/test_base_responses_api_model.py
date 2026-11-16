@@ -909,6 +909,7 @@ def test_record_swallows_store_failure_and_marks_capture_incomplete(tmp_path, mo
     from nemo_gym.models.model_call_capture import _record
 
     store = CaptureStore(tmp_path)
+    store.mark_pending("r", "call-1")
     monkeypatch.setattr(store, "record", MagicMock(side_effect=RuntimeError("disk full")))
 
     # Best-effort: a failing store must not raise out of _record.
@@ -927,6 +928,43 @@ def test_record_swallows_store_failure_and_marks_capture_incomplete(tmp_path, mo
         latency_ms=1.0,
     )
     assert store.is_incomplete("r")
+    # The row will never land, so its claim is released instead of holding readers to the drain timeout.
+    assert store.has_pending("r") is False
+
+
+def test_record_logs_a_claim_it_cannot_release(tmp_path, monkeypatch, caplog):
+    from nemo_gym.models.model_call_capture import _record
+
+    store = CaptureStore(tmp_path)
+    monkeypatch.setattr(store, "record", MagicMock(side_effect=RuntimeError("disk full")))
+    monkeypatch.setattr(store, "clear_pending", MagicMock(side_effect=ValueError("bad id")))
+
+    _record(
+        store,
+        "chat",
+        "srv",
+        b"{}",
+        rollout_id="r",
+        model_call_id="call-1",
+        started_at=100.0,
+        completed_at=100.01,
+        response_body={},
+        status_code=200,
+        error_category=None,
+        latency_ms=1.0,
+    )
+    assert "Could not release the capture claim" in caplog.text
+
+
+def test_capture_claim_write_failures_are_logged_not_raised(tmp_path, caplog):
+    store = CaptureStore(tmp_path)
+    store.claims_path_for("r").mkdir()
+
+    store.mark_pending("r", "call-1")
+    store.clear_pending("r", "call-1")
+
+    assert "Could not mark model-call capture pending" in caplog.text
+    assert "Could not clear model-call capture pending" in caplog.text
 
 
 def test_record_falls_back_to_raw_when_request_parser_raises(tmp_path, monkeypatch):
@@ -1785,7 +1823,7 @@ def test_capture_store_pending_claims_are_scoped_to_one_rollout(tmp_path):
 
     store.mark_pending("1-0-retry1", "call-1")
 
-    # The dot after the rollout id keeps a prefix from matching a longer id.
+    # Claims live in the rollout's own file, so a prefix of its id sees none.
     assert store.has_pending("1-0-retry1") is True
     assert store.has_pending("1-0") is False
 
@@ -1793,13 +1831,101 @@ def test_capture_store_pending_claims_are_scoped_to_one_rollout(tmp_path):
     assert store.has_pending("1-0-retry1") is False
 
 
-def test_capture_store_pending_token_survives_an_unsafe_model_call_id(tmp_path):
+def test_capture_store_claim_survives_an_unsafe_model_call_id(tmp_path):
     store = CaptureStore(tmp_path)
 
-    store.mark_pending("1-0", "a/b c.d")
-
+    # The id is a JSON string in the claims file, never part of a file name.
+    store.mark_pending("1-0", 'a/b "c".d')
     assert store.has_pending("1-0") is True
-    assert store.pending_path_for("1-0", "a/b c.d").name == "1-0.a_b_c_d.capture.pending"
+
+    store.clear_pending("1-0", 'a/b "c".d')
+    assert store.has_pending("1-0") is False
+    assert [path.name for path in tmp_path.iterdir()] == ["1-0.capture.claims"]
+
+
+def test_record_releases_the_claim_after_the_row_is_written(tmp_path, monkeypatch):
+    from nemo_gym.models.model_call_capture import _record
+
+    store = CaptureStore(tmp_path)
+    store.mark_pending("r", "call-1")
+    record = store.record
+
+    def record_then_check(rollout_id, exchange):
+        record(rollout_id, exchange)
+        # The claim is still open while the row is being written.
+        assert store.has_pending(rollout_id) is True
+
+    monkeypatch.setattr(store, "record", record_then_check)
+    _record(
+        store,
+        "chat",
+        "srv",
+        b"{}",
+        rollout_id="r",
+        model_call_id="call-1",
+        started_at=100.0,
+        completed_at=100.01,
+        response_body={},
+        status_code=200,
+        error_category=None,
+        latency_ms=1.0,
+    )
+
+    assert store.has_pending("r") is False
+    assert [orjson.loads(line) for line in store.claims_path_for("r").read_bytes().splitlines() if line] == [
+        {"claim": "call-1"},
+        {"release": "call-1"},
+    ]
+
+
+def test_a_cancelled_call_keeps_its_claim_until_the_detached_write_finishes(tmp_path, monkeypatch):
+    import asyncio
+    import threading
+
+    from nemo_gym.models.model_call_capture import _CaptureMiddleware
+    from nemo_gym.rollouts.model_calls import await_model_call_capture_quiescence
+
+    store = CaptureStore(tmp_path)
+    writing, finish = threading.Event(), threading.Event()
+    record = store.record
+
+    def held_record(rollout_id, exchange):
+        writing.set()
+        finish.wait(5)
+        record(rollout_id, exchange)
+
+    monkeypatch.setattr(store, "record", held_record)
+
+    async def run() -> None:
+        async def app(scope, receive, send) -> None:
+            del scope
+            await receive()
+            await send({"type": "http.response.start", "status": 200, "headers": []})
+            await send({"type": "http.response.body", "body": b'{"id":"resp-1"}', "more_body": False})
+
+        async def receive() -> dict:
+            return {"type": "http.request", "body": b'{"input":"x"}', "more_body": False}
+
+        async def send(_message: dict) -> None:
+            pass
+
+        path = "/ng-rollout/r-cancel/v1/responses"
+        task = asyncio.create_task(
+            _CaptureMiddleware(app, store=store, model_server_name="srv")(
+                {"type": "http", "path": path, "raw_path": path.encode(), "headers": []}, receive, send
+            )
+        )
+        await asyncio.to_thread(writing.wait, 5)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        # The caller is gone but the write continues in its thread, which releases the claim when done.
+        assert store.has_pending("r-cancel") is True
+        finish.set()
+        assert await await_model_call_capture_quiescence("r-cancel", [tmp_path], timeout_s=5.0) is True
+        assert len(store.read("r-cancel")) == 1
+
+    asyncio.run(run())
 
 
 def test_capture_claim_is_visible_while_the_call_is_still_in_flight(tmp_path):
@@ -1858,6 +1984,11 @@ def test_capture_claim_is_visible_while_the_call_is_still_in_flight(tmp_path):
         assert await await_model_call_capture_quiescence("r-inflight", [tmp_path], timeout_s=5.0) is True
         assert store.has_pending("r-inflight") is False
         assert len(store.read("r-inflight")) == 1
+        # One claims file per rollout, appended to; no per-call marker is created or deleted.
+        assert sorted(path.name for path in tmp_path.iterdir()) == [
+            "r-inflight.capture.claims",
+            "r-inflight.capture.jsonl",
+        ]
 
     asyncio.run(run())
 
