@@ -71,9 +71,9 @@ class BirdSqlCatalogResourcesServerConfig(BirdSqlResourcesServerConfig):
     sandbox_config: dict[str, Any] = Field(default_factory=dict)
     # In the image: the Python that has Auto Ontology, the folder whose .env names the source databases, and the
     # command that starts the catalog's Postgres.
-    catalog_python: str = "/opt/auto-ontology-eval/.venv/bin/python"
-    catalog_workdir: str = "/opt/auto-ontology-eval"
-    catalog_start_command: str = "/opt/auto-ontology-eval/start-catalog"
+    catalog_python: str = "/opt/auto-ontology/.venv/bin/python"
+    catalog_workdir: str = "/opt/bird-catalog"
+    catalog_start_command: str = "/opt/bird-catalog/start-catalog"
     # Environment variables for Auto Ontology in the sandbox, such as the key of its embedding endpoint
     # (DEFAULT_MODELS_API_KEY), which retrieval calls for each search.
     catalog_environment: dict[str, str] = Field(default_factory=dict)

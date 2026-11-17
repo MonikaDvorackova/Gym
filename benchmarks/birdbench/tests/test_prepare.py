@@ -4,6 +4,8 @@
 
 import json
 import sqlite3
+import sys
+import types
 
 import pytest
 
@@ -119,18 +121,56 @@ class TestPrepareDialect:
 
 
 class TestPrepareCatalogTools:
-    def test_rows_offer_the_catalog_tools_and_no_schema(self, prepared, tmp_path):
-        rows = prepared([_entry(question="How many students?")], catalog_tools=True)
-
-        assert [tool["name"] for tool in rows[0]["responses_create_params"]["tools"]] == [
-            "retrieve",
-            "run_sql",
-            "submit",
+    @pytest.fixture(autouse=True)
+    def auto_ontology_prompt(self, monkeypatch):
+        # The real one imports Auto Ontology, which only the auto_ontology prepare project installs.
+        stub = types.ModuleType("benchmarks.birdbench.auto_ontology.react_prompt")
+        stub.episode_input = lambda question, evidence: [
+            {"role": "system", "content": "ao system"},
+            {"role": "user", "content": f"Q={question} E={evidence}"},
         ]
+        stub.tool_definitions = lambda: [
+            {"type": "function", "name": name} for name in ("retrieve", "run_sql", "submit")
+        ]
+        monkeypatch.setitem(sys.modules, "benchmarks.birdbench.auto_ontology.react_prompt", stub)
+
+    def test_rows_start_as_auto_ontologys_episode_and_carry_no_schema(self, prepared, tmp_path):
+        rows = prepared(
+            [_entry(question="How many students?", evidence="students refers to the students table")],
+            catalog_tools=True,
+        )
+
+        params = rows[0]["responses_create_params"]
+        assert [tool["name"] for tool in params["tools"]] == ["retrieve", "run_sql", "submit"]
+        # The evidence stays apart from the question, as Auto Ontology shows it.
+        assert params["input"][1]["content"] == "Q=How many students? E=students refers to the students table"
+        assert rows[0]["question"] == "How many students?"
         assert "sql_context" not in rows[0]
         # The agent searches the catalog, so no schema is built for the rows.
         assert _FakeDbHandle.instances == []
         assert [p.name for p in (tmp_path / "data").iterdir()] == ["birdbench_sqlite_dev_catalog_tools.jsonl"]
+
+    def test_agent_context_rows_carry_the_task_for_the_auto_ontology_agent(self, prepared, tmp_path):
+        rows = prepared(
+            [_entry(question="How many students?", evidence="students refers to the students table")],
+            catalog_tools=True,
+            agent_context=True,
+        )
+
+        assert rows[0]["agent_context"] == {
+            "agent": {
+                "values": {
+                    "question": "How many students?",
+                    "evidence": "students refers to the students table",
+                    "database": "db1",
+                }
+            }
+        }
+        assert [p.name for p in (tmp_path / "data").iterdir()] == ["birdbench_sqlite_dev_auto_ontology_agent.jsonl"]
+
+    def test_agent_context_needs_catalog_tools(self, prepared):
+        with pytest.raises(ValueError, match="needs catalog_tools"):
+            prepared([_entry()], agent_context=True)
 
     def test_catalog_tools_run_sqlite_only(self, prepared):
         with pytest.raises(ValueError, match="SQLite"):
@@ -213,6 +253,7 @@ class TestCli:
             "split": "train",
             "train_dir": None,
             "catalog_tools": False,
+            "agent_context": False,
         }
 
     def test_catalog_tools_flag_is_forwarded(self, monkeypatch):

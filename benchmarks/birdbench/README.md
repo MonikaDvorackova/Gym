@@ -139,10 +139,55 @@ other flags pass through to `gym eval run`.
 `rollouts.jsonl` has one row per rollout (prompt, response, reward, verifier fields like `extracted_sql` and
 `failure_reason`).
 
+## Auto Ontology
+
+[Auto Ontology](https://github.com/NVIDIA/auto-ontology) answers a question from a catalog of the database: its tables
+and columns, the business terms and definitions compiled over them, and embeddings to search both. Its ReAct agent
+searches the catalog, tests queries and submits one. Three configs run BIRD dev with or without it, on the same rows
+and graded by `bird_sql`:
+
+| Config | Agent | What the model sees |
+|---|---|---|
+| `config.yaml` (control) | `simple_agent` | The question, the evidence and the schema, in one prompt |
+| `catalog_tools.yaml` | `simple_agent`, or any harness | Auto Ontology's prompt and its tools (`retrieve`, `run_sql`, `submit`), which `bird_sql` serves |
+| `auto_ontology_agent.yaml` | `auto_ontology_agent` | Auto Ontology's own loop, prompts and tools, run in the episode's sandbox |
+
+`auto_ontology/pyproject.toml` pins Auto Ontology once: the catalog image, Auto Ontology's prompt and tools in the rows,
+and the agent all follow it.
+
+### The catalog image
+
+```bash
+benchmarks/birdbench/auto_ontology/build_image.sh <models.env>   # tag: nemo-gym/bird-catalog:dev
+```
+
+The image holds Auto Ontology at the pinned commit, installed from its own repository and lock file, the BIRD dev
+databases and their catalog. The build (`auto_ontology/build_catalog.py`) migrates the catalog with Auto Ontology's
+Alembic migrations, then for each database ingests the schema, writes BIRD's column descriptions (from its
+`database_description` CSVs, which a SQLite database does not carry), embeds the described catalog and compiles the
+semantic layer. `<models.env>` holds the model keys (`DEFAULT_MODELS_API_KEY`, and `*_MODEL` settings where they differ
+from Auto Ontology's defaults); it reaches the build as a BuildKit secret, never a layer. The build fails when a model
+call failed after Auto Ontology's retries or a database has no vectors, since Auto Ontology logs both and goes on.
+
+Both Auto Ontology configs prepare their rows in the `auto_ontology` project, which installs the pinned Auto Ontology:
+
+```bash
+gym eval prepare --config benchmarks/birdbench/catalog_tools.yaml        # data/birdbench_sqlite_dev_catalog_tools.jsonl
+gym eval prepare --config benchmarks/birdbench/auto_ontology_agent.yaml  # data/birdbench_sqlite_dev_auto_ontology_agent.jsonl
+```
+
+### The Auto Ontology agent
+
+`auto_ontology_agent.yaml` runs `responses_api_agents/auto_ontology_agent`: each episode gets a sandbox from the
+catalog image, and Auto Ontology's `run_episode` runs there on the policy's Model Server. The agent answers with the
+submitted query in a fenced `sql` block, which `bird_sql` grades as it grades `simple_agent`'s. Give the embedding key
+as `++auto_ontology_api_key=<key>`. See the agent's README for its sandbox and network.
+
 ## Catalog tools
 
-`catalog_tools.yaml` runs BIRD dev with [Auto Ontology](https://github.com/NVIDIA/auto-ontology)'s catalog tools in
-place of the schema in the prompt. The agent sees only the question and calls three tools:
+`catalog_tools.yaml` runs BIRD dev with Auto Ontology's catalog tools in place of the schema in the prompt. Each row
+starts as Auto Ontology's agent starts an episode: its system prompt, the question with the evidence apart, and its
+tools:
 
 | Tool | What it does |
 |---|---|
@@ -161,5 +206,5 @@ gym eval run --config benchmarks/birdbench/catalog_tools.yaml --model-type vllm_
 ```
 
 `bird_catalog_api_key` is the key of the embedding endpoint the catalog was built with: `retrieve` embeds each search.
-The rows offer the tools in `responses_create_params.tools`, and the prompt is `prompts/catalog_tools_sqlite.yaml`.
-The tools allow 24 calls per episode, as Auto Ontology's ReAct agent does; past that, only `submit` is served.
+The tools allow 24 calls per episode, as Auto Ontology's ReAct agent does; past that, only `submit` is served. Unlike
+Auto Ontology's own loop, the harness gets no last-turn narrowing to `submit` and no nudges.

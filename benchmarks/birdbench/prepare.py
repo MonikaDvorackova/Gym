@@ -43,7 +43,6 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from benchmarks.birdbench.build_db_values import DbHandle
-from resources_servers.bird_sql.catalog_tools import tool_definitions
 from resources_servers.bird_sql.setup_bird_sql import ensure_bird_sql, ensure_bird_train
 
 
@@ -58,9 +57,12 @@ VERIFIED_TRAIN_URL = "https://raw.githubusercontent.com/uiuc-kang-lab/ReViSQL/ma
 TRAIN_CORPUS_LIMIT_PER_COLUMN = 2000
 
 
-def output_fpath_for(dialect: str, split: str = "dev", *, catalog_tools: bool = False) -> Path:
-    """``data/birdbench_<dialect>_<split>.jsonl``, or ``..._catalog_tools.jsonl`` for the catalog-tools rows."""
-    suffix = "_catalog_tools" if catalog_tools else ""
+def output_fpath_for(
+    dialect: str, split: str = "dev", *, catalog_tools: bool = False, agent_context: bool = False
+) -> Path:
+    """``data/birdbench_<dialect>_<split>.jsonl``, with ``_catalog_tools`` for the catalog-tools rows and
+    ``_auto_ontology_agent`` for those rows with an agent context."""
+    suffix = "_auto_ontology_agent" if agent_context else "_catalog_tools" if catalog_tools else ""
     return DATA_DIR / f"birdbench_{dialect}_{split}{suffix}.jsonl"
 
 
@@ -147,6 +149,7 @@ def prepare(
     split: str = "dev",
     train_dir: Optional[str] = None,
     catalog_tools: bool = False,
+    agent_context: bool = False,
 ) -> Path:
     """Download BIRD dev (or read local train), produce the prepared jsonl for ``split``/``dialect``. Returns its path.
 
@@ -167,17 +170,26 @@ def prepare(
         split: ``dev`` (default; the 1534-task benchmark) or ``train`` (the uberset, see module docstring).
         train_dir: ``split="train"`` only: extracted BIRD ``train/`` directory holding ``train.json`` and
             ``train_databases/``. Default: downloaded by ``ensure_bird_train()``.
-        catalog_tools: Write rows for the ``bird_sql`` catalog server (``catalog_tools.yaml``): each offers its
-            tools (``retrieve``, ``run_sql``, ``submit``) and has no ``sql_context``, since the agent searches the
-            catalog instead. These rows go to their own file, see ``output_fpath_for``. SQLite only.
+        catalog_tools: Write rows for the ``bird_sql`` catalog server (``catalog_tools.yaml``). Each starts as Auto
+            Ontology's ReAct agent starts an episode, at the version ``auto_ontology/pyproject.toml`` pins: its
+            system prompt, the question with its evidence apart, and its tools (``retrieve``, ``run_sql``,
+            ``submit``). No ``sql_context``: the agent searches the catalog instead. Needs Auto Ontology, so it runs
+            in the ``auto_ontology`` prepare project. These rows go to their own file, see ``output_fpath_for``.
+            SQLite only.
+        agent_context: With ``catalog_tools``, also give each row the task in its agent context (the question, its
+            evidence and its database), for ``auto_ontology_agent``, which runs Auto Ontology's own loop
+            (``auto_ontology_agent.yaml``). These rows go to their own file: an agent that takes no agent context,
+            such as ``simple_agent``, refuses a seed that carries one.
     """
     if dialect not in DIALECTS:
         raise ValueError(f"Unsupported dialect {dialect!r}; expected one of {DIALECTS}")
     if split not in SPLITS:
         raise ValueError(f"Unsupported split {split!r}; expected one of {SPLITS}")
+    if agent_context and not catalog_tools:
+        raise ValueError("agent_context needs catalog_tools")
     if catalog_tools and dialect != "sqlite":
         raise ValueError("The catalog tools run SQLite queries; use dialect='sqlite'")
-    output_fpath = output_fpath_for(dialect, split, catalog_tools=catalog_tools)
+    output_fpath = output_fpath_for(dialect, split, catalog_tools=catalog_tools, agent_context=agent_context)
     output_fpath.parent.mkdir(parents=True, exist_ok=True)
 
     databases_dir = databases_dir_for(split, train_dir)
@@ -186,6 +198,10 @@ def prepare(
 
     db_ids = sorted({entry["db_id"] for entry in entries})
     db_handles: Dict[str, DbHandle] = {}
+    if catalog_tools:
+        from benchmarks.birdbench.auto_ontology.react_prompt import episode_input, tool_definitions
+
+        tools = tool_definitions()
     if not catalog_tools:
         print("Building per-db schemas (types, PK/FK, descriptions, BM25 indexes)...")
     # The catalog-tools rows show no schema, so they need no index.
@@ -210,7 +226,10 @@ def prepare(
             evidence = entry.get("evidence")
             # Evidence carries the literal-value hints (e.g. "triple type bonds refers to
             # bond_type = '#'") that the model needs to disambiguate.
-            if include_evidence and evidence:
+            if catalog_tools:
+                # Auto Ontology shows the evidence apart from the question.
+                question = entry["question"]
+            elif include_evidence and evidence:
                 question = evidence + "\n" + entry["question"]
             else:
                 question = entry["question"]
@@ -224,7 +243,15 @@ def prepare(
                 "id": i,
             }
             if catalog_tools:
-                row["responses_create_params"] = {"tools": tool_definitions()}
+                row["evidence"] = (evidence or "") if include_evidence else ""
+                row["responses_create_params"] = {
+                    "input": episode_input(question, row["evidence"]),
+                    "tools": tools,
+                }
+                if agent_context:
+                    row["agent_context"] = {
+                        "agent": {"values": {"question": question, "evidence": row["evidence"], "database": db_id}}
+                    }
             else:
                 row["sql_context"] = db_handles[db_id].sql_context_for_question(question)
             f_out.write(json.dumps(row) + "\n")
@@ -244,6 +271,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     parser.add_argument("--dscp", default="name_or_col_dscp", help="See prepare()'s `dscp` argument")
     parser.add_argument("--no-evidence", action="store_true", help="Do not prepend BIRD's `evidence` to the question")
     parser.add_argument("--catalog-tools", action="store_true", help="See prepare()'s `catalog_tools` argument")
+    parser.add_argument("--agent-context", action="store_true", help="See prepare()'s `agent_context` argument")
     args = parser.parse_args(argv)
     prepare(
         include_evidence=not args.no_evidence,
@@ -252,6 +280,7 @@ def main(argv: Optional[List[str]] = None) -> None:
         split=args.split,
         train_dir=args.train_dir,
         catalog_tools=args.catalog_tools,
+        agent_context=args.agent_context,
     )
 
 

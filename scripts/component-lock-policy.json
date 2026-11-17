@@ -1,4 +1,10 @@
 {
+  "benchmarks/birdbench/auto_ontology": {
+    "include-dependencies": [
+      "alembic",
+      "sqlalchemy"
+    ]
+  },
   "environment_servers/nemo_user_sim": {
     "override-dependencies": [
       "pyarrow>=25.0.1,<26"

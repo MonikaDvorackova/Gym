@@ -153,10 +153,9 @@ sandbox.
 - a command that starts the catalog's Postgres (`catalog_start_command`), with the `POSTGRES_*` settings in the
   image's environment.
 
-The defaults match the image that
-[auto-ontology-eval](https://github.com/NVIDIA/auto-ontology-eval)'s `scripts/build_agent_image.sh` builds, which
-ingests and compiles the BIRD dev databases with Auto Ontology's own pipeline. `catalog_environment` passes settings
-that do not belong in an image, such as the embedding endpoint's key (`DEFAULT_MODELS_API_KEY`).
+The defaults match the image `benchmarks/birdbench/auto_ontology/build_image.sh` builds, from the Auto Ontology commit
+that directory's `pyproject.toml` pins. `catalog_environment` passes settings that do not belong in an image, such as
+the embedding endpoint's key (`DEFAULT_MODELS_API_KEY`).
 
 | Setting | Default | Meaning |
 |---|---|---|

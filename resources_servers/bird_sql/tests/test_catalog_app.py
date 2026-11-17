@@ -32,7 +32,7 @@ from resources_servers.bird_sql.catalog_app import (
     _Episode,
 )
 from resources_servers.bird_sql.catalog_tool_server import Episode, request, serve, wait
-from resources_servers.bird_sql.catalog_tools import ACCEPTED, tool_definitions
+from resources_servers.bird_sql.catalog_tools import ACCEPTED
 
 
 def _server(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, **kwargs) -> BirdSqlCatalogResourcesServer:
@@ -91,22 +91,6 @@ def tiny_db(tmp_path: Path) -> Path:
     connection.commit()
     connection.close()
     return tmp_path
-
-
-# ----- tool definitions ----- #
-
-
-def test_the_rows_offer_the_three_tools_with_the_routes_arguments() -> None:
-    tools = {tool["name"]: tool for tool in tool_definitions()}
-
-    assert set(tools) == {"retrieve", "run_sql", "submit"}
-    assert tools["retrieve"]["parameters"]["required"] == ["query"]
-    assert tools["run_sql"]["parameters"]["required"] == ["sql"]
-    assert tools["submit"]["parameters"]["required"] == ["sql"]
-    assert set(tools["submit"]["parameters"]["properties"]) == {"sql", "response", "assumptions"}
-    kinds = tools["retrieve"]["parameters"]["properties"]["kinds"]["anyOf"][0]["items"]["enum"]
-    assert kinds == ["term", "attribute", "definition", "analysis"]
-    assert all(tool["type"] == "function" and tool["description"] for tool in tools.values())
 
 
 # ----- what verify grades ----- #
@@ -176,7 +160,7 @@ async def test_the_seed_starts_the_catalog_and_the_tools_and_release_stops_the_s
     }
     assert "def serve(" in spec.files[SANDBOX_TOOL_SERVER]
     start, serve_tools, wait_tools = sandbox.exec.await_args_list
-    assert start.args == ("/opt/auto-ontology-eval/start-catalog",)
+    assert start.args == ("/opt/bird-catalog/start-catalog",)
     assert " serve " in serve_tools.args[0] and serve_tools.args[0].endswith("&")
     assert serve_tools.kwargs["env"] == {"DEFAULT_MODELS_API_KEY": "embed-key"}
     assert " wait " in wait_tools.args[0]
